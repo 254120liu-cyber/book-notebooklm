@@ -27,7 +27,7 @@ Claude's memory is unreliable for specific book content. Page numbers, definitio
 
 ```bash
 # 1. Clone into Claude Code skills directory
-git clone https://github.com/YOUR_USERNAME/book-notebooklm.git ~/.claude/skills/book-notebooklm
+git clone https://github.com/254120liu-cyber/book-notebooklm.git ~/.claude/skills/book-notebooklm
 
 # 2. One-click setup (installs all dependencies + guides you through auth)
 #    Windows: double-click setup.bat in the skill folder
