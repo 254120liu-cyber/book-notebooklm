@@ -43,10 +43,10 @@ This lets the user know what's authoritative vs what's your interpretation.
 
 ### R3: If NotebookLM says content isn't indexed, be honest
 
-NotebookLM currently only has chapters 1-4 (pages 1-170) of 《加密与解密第四版》. If a question is about later chapters:
+If NotebookLM indicates the content is not in its source material:
 
 ```
-"NotebookLM 中暂无第X章的内容。以下是基于我自身知识的回答，可能与书中有出入。[标注：未经验证]"
+"NotebookLM 中暂无此部分内容。以下是基于我自身知识的回答，可能与书中有出入。[标注：未经验证]"
 ```
 
 Never silently substitute your own knowledge when the book content is unavailable.
@@ -80,20 +80,18 @@ Always resume the same NotebookLM conversation. The wrapper handles this automat
 When starting a learning session, proactively verify the pipeline is healthy:
 
 ```bash
-py -3.11 nlm_query.py --status   # Check auth + notebook context
-py -3.11 nlm_query.py --warmup   # Ensure regional cookies are fresh
+py -3.11 scripts/nlm_query.py --status   # Check auth + notebook context
+py -3.11 scripts/nlm_query.py --warmup   # Ensure regional cookies are fresh
 ```
 
 Do this at the start of each session so the user never hits auth failures mid-learning. If status shows "EXPIRED", run `--relogin` silently before the user asks their first question.
 
 ### R9: Chapter coverage awareness
 
-《加密与解密第四版》 currently has only **chapters 1-4 (pages 1-170)** indexed in NotebookLM. When the user asks about content from later chapters (5+), NotebookLM will respond with "此内容不在源文件中，以下为外部知识".
-
-**Always parse NotebookLM's answer for this signal.** If you see "外部知识" or "不在源文件中" or "非源文件正文内容":
+NotebookLM may not index the entire book. Always parse its answer for signals like "外部知识", "不在源文件中", or "非源文件正文内容". When detected:
 1. Tell the user clearly that this answer is NOT from the book
 2. Mark it as `[外部知识，非书中原文]`
-3. Remind them which chapters ARE indexed (1-4)
+3. Remind them which chapters ARE indexed (check `--health` for notebook info)
 4. Suggest uploading the relevant chapter PDF if they need authoritative answers
 
 This is critical — users may assume all answers come from the book unless you explicitly flag otherwise.
@@ -142,11 +140,41 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 
 ---
 
+## Setup (required once for new users)
+
+1. Install prerequisites:
+   ```bash
+   pip install notebooklm-py httpx
+   playwright install chromium
+   ```
+
+2. Authenticate with Google:
+   ```bash
+   notebooklm login --browser msedge
+   ```
+
+3. Create a notebook and upload your book PDF via NotebookLM web UI
+
+4. Set your notebook ID:
+   ```bash
+   # Add to your shell profile or set per-session
+   export NOTEBOOKLM_DEFAULT_NB="your_notebook_id"
+   ```
+
+5. Verify setup:
+   ```bash
+   py -3.11 scripts/nlm_query.py --health
+   ```
+
+---
+
 ## Commands
+
+Run from the skill directory. Claude Code resolves `scripts/` relative to where this skill is installed.
 
 | Command | Purpose |
 |---------|---------|
-| `nlm_query.py "question"` | Query book content |
+| `py -3.11 scripts/nlm_query.py "question"` | Query book content |
 | `nlm_query.py --status` | Check auth status |
 | `nlm_query.py --relogin` | Force re-login |
 | `nlm_query.py --warmup` | Warm up regional cookies |
@@ -155,7 +183,7 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 
 Query path:
 ```
-py -3.11 C:\Users\25437\.claude\skills\book-notebooklm\scripts\nlm_query.py "你的问题"
+py -3.11 scripts/nlm_query.py "你的问题"
 ```
 
 Output is written to `NLM_OUTPUT:<path>` — read it with the Read tool.
@@ -183,19 +211,22 @@ This ensures valid session cookies exist regardless of which VPN node is active.
 
 ## Notebook IDs
 
-| Book | Notebook ID (short) | Chapters Indexed | Status |
-|------|---------------------|------------------|--------|
-| 加密与解密第四版 | 51429604 | 1-4 (pp.1-170) | Active |
+Configure via `NOTEBOOKLM_DEFAULT_NB` environment variable, or pass `--notebook <id>` per query.
+
+| Book | Notebook ID | Status |
+|------|-------------|--------|
+| *(your book here)* | `export NOTEBOOKLM_DEFAULT_NB="..."` | — |
 
 Use short prefix IDs (6+ chars), not the full UUID with dashes.
 
 To add a new book:
 1. Create notebook: `py -3.11 -m notebooklm create "Book Name"`
 2. Add PDF source via NotebookLM web or CLI
-3. Record the ID here
+3. Set `NOTEBOOKLM_DEFAULT_NB` or record the ID here
 
 ## Limitations
 
-- 《加密与解密第四版》 only chapters 1-4 (pages 1-170) are indexed. Later chapters need uploading.
+- Large scanned PDFs may have partial OCR coverage in NotebookLM. Use `nlm_pdf_splitter.py` to split into chapter-sized chunks.
 - Chrome/Edge v127+ cookie encryption (v20) blocks direct disk extraction. Playwright login is the fallback.
 - Google session cookies expire after hours. The wrapper handles this automatically.
+- Some regions (e.g., Hong Kong) are blocked by Google for NotebookLM access.

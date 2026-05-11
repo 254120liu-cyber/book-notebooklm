@@ -28,12 +28,19 @@ import time
 
 # ── Configuration ──────────────────────────────────────────
 
-# Discover notebooklm executable — fall back to hardcoded Python311 path
+# Discover notebooklm executable
 _NLM_EXE = shutil.which("notebooklm")
 if not _NLM_EXE:
-    _NLM_EXE = os.path.expanduser(
-        r"~\AppData\Local\Programs\Python\Python311\Scripts\notebooklm.exe"
-    )
+    # Fallback: search common Python install locations on Windows
+    _candidates = []
+    for ver in ("313", "312", "311", "310"):
+        _candidates.append(os.path.expanduser(
+            rf"~\AppData\Local\Programs\Python\Python{ver}\Scripts\notebooklm.exe"
+        ))
+    for c in _candidates:
+        if os.path.exists(c):
+            _NLM_EXE = c
+            break
 
 DEFAULT_NOTEBOOK = os.environ.get("NOTEBOOKLM_DEFAULT_NB", "51429604")
 AUTHUSER = os.environ.get("NOTEBOOKLM_AUTHUSER", "0")
