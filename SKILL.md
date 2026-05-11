@@ -80,8 +80,8 @@ Always resume the same NotebookLM conversation. The wrapper handles this automat
 When starting a learning session, proactively verify the pipeline is healthy:
 
 ```bash
-py -3.11 scripts/nlm_query.py --status   # Check auth + notebook context
-py -3.11 scripts/nlm_query.py --warmup   # Ensure regional cookies are fresh
+py -3 scripts/nlm_query.py --status   # Check auth + notebook context
+py -3 scripts/nlm_query.py --warmup   # Ensure regional cookies are fresh
 ```
 
 Do this at the start of each session so the user never hits auth failures mid-learning. If status shows "EXPIRED", run `--relogin` silently before the user asks their first question.
@@ -140,31 +140,22 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 
 ---
 
-## Setup (required once for new users)
+## Setup (one-click)
 
-1. Install prerequisites:
-   ```bash
-   pip install notebooklm-py httpx
-   playwright install chromium
-   ```
+**Windows:** Double-click `setup.bat` in the skill directory.
+**macOS/Linux:** Run `bash setup.sh` in the skill directory.
 
-2. Authenticate with Google:
-   ```bash
-   notebooklm login --browser msedge
-   ```
+The setup script installs all dependencies, authenticates with Google, and verifies everything works.
 
-3. Create a notebook and upload your book PDF via NotebookLM web UI
+**Manual setup** (if the script fails):
 
-4. Set your notebook ID:
-   ```bash
-   # Add to your shell profile or set per-session
-   export NOTEBOOKLM_DEFAULT_NB="your_notebook_id"
-   ```
+1. Install Python deps: `pip install notebooklm-py httpx PyPDF2`
+2. Install browser: `playwright install chromium`
+3. Login: `notebooklm login --browser msedge`
+4. Create a notebook at https://notebooklm.google.com and upload your book PDF
+5. Set notebook ID: `export NOTEBOOKLM_DEFAULT_NB="your_id"` (or `set` on Windows)
 
-5. Verify setup:
-   ```bash
-   py -3.11 scripts/nlm_query.py --health
-   ```
+**Verify:** `py -3 scripts/nlm_query.py --health`
 
 ---
 
@@ -174,7 +165,7 @@ Run from the skill directory. Claude Code resolves `scripts/` relative to where 
 
 | Command | Purpose |
 |---------|---------|
-| `py -3.11 scripts/nlm_query.py "question"` | Query book content |
+| `py -3 scripts/nlm_query.py "question"` | Query book content |
 | `nlm_query.py --status` | Check auth status |
 | `nlm_query.py --relogin` | Force re-login |
 | `nlm_query.py --warmup` | Warm up regional cookies |
@@ -183,7 +174,7 @@ Run from the skill directory. Claude Code resolves `scripts/` relative to where 
 
 Query path:
 ```
-py -3.11 scripts/nlm_query.py "你的问题"
+py -3 scripts/nlm_query.py "你的问题"
 ```
 
 Output is written to `NLM_OUTPUT:<path>` — read it with the Read tool.

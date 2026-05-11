@@ -19,30 +19,30 @@ Claude's memory is unreliable for specific book content. Page numbers, definitio
 
 ## Prerequisites
 
-- Python 3.11+
-- [notebooklm-py](https://github.com/teng-lin/notebooklm-py) (`pip install notebooklm-py`)
-- Playwright Chromium (`playwright install chromium`)
-- httpx (`pip install httpx`) — for regional cookie warmup
+- Python 3.10+
 - A Google account with NotebookLM access
 - A VPN (for users in regions where Google is blocked)
 
-## Quick Start
+## Quick Install
 
 ```bash
-# 1. Authenticate with NotebookLM
-notebooklm login --browser msedge
+# 1. Clone into Claude Code skills directory
+git clone https://github.com/YOUR_USERNAME/book-notebooklm.git ~/.claude/skills/book-notebooklm
 
-# 2. Create a notebook and upload your book PDF (via NotebookLM web UI)
+# 2. One-click setup (installs all dependencies + guides you through auth)
+#    Windows: double-click setup.bat in the skill folder
+#    macOS/Linux: bash ~/.claude/skills/book-notebooklm/setup.sh
 
-# 3. Set the notebook context
-notebooklm use <notebook_id>
+# 3. Create a notebook at https://notebooklm.google.com and upload your book PDF
 
-# 4. Query your book
-py -3.11 nlm_query.py "What does Chapter 3 cover about IDA Pro?"
+# 4. Set your notebook ID
+#    Windows: set NOTEBOOKLM_DEFAULT_NB=abc123
+#    macOS/Linux: export NOTEBOOKLM_DEFAULT_NB=abc123
 
-# 5. Read the answer
-cat %TEMP%\nlm_answer.txt
+# 5. Done! Ask Claude anything about your book.
 ```
+
+Or install via Claude Code skill registry: `npx skills add <github-user>/book-notebooklm`
 
 ## Commands
 
@@ -64,16 +64,16 @@ cat %TEMP%\nlm_answer.txt
 
 ```bash
 # Auto-split into ~100-page chunks
-py -3.11 nlm_pdf_splitter.py book.pdf
+py -3 nlm_pdf_splitter.py book.pdf
 
 # Use chapter preset
-py -3.11 nlm_pdf_splitter.py book.pdf --preset "加密与解密第四版"
+py -3 nlm_pdf_splitter.py book.pdf --preset "加密与解密第四版"
 
 # Custom page ranges
-py -3.11 nlm_pdf_splitter.py book.pdf --ranges "1-59,60-119,120-200"
+py -3 nlm_pdf_splitter.py book.pdf --ranges "1-59,60-119,120-200"
 
 # List available presets
-py -3.11 nlm_pdf_splitter.py --list-presets
+py -3 nlm_pdf_splitter.py --list-presets
 ```
 
 ## How It Works
