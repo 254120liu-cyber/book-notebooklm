@@ -13,6 +13,26 @@ Query Google NotebookLM for authoritative book content. This skill wraps the `no
 
 These rules override any other behavior. Violating them misleads the user.
 
+### R0: Zero-command book setup — Claude does ALL the work
+
+When the user wants to start learning a new book, Claude handles everything. The user should NEVER need to type any command.
+
+**Trigger phrases:** "我要学这本书", "帮我添加这本书", "我想学XX", or user drops a PDF in the project directory.
+
+**Workflow:**
+1. Detect PDFs in the current directory (`ls *.pdf`)
+2. If multiple PDFs, ask the user which one. If one, confirm and proceed.
+3. Run `nlm_add_book.py` automatically:
+   ```bash
+   py -3 scripts/nlm_add_book.py "<pdf_path>" --name "<book_name>"
+   ```
+4. Report success to the user: "已添加《XXX》，现在可以直接问我书中的任何问题了。"
+5. If auth fails during upload, auto-relogin and retry.
+
+**Compression:** The script auto-handles this. If a PDF is >200MB, it compresses. If compression can't get it under 200MB, tell the user the PDF needs to be split first, and offer to run the splitter.
+
+**Never tell the user to run commands themselves.** Claude runs everything silently.
+
 ### R1: NotebookLM First — NEVER answer book questions from memory
 
 When the user asks a question about any book they're studying:
@@ -140,26 +160,19 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 
 ---
 
-## Setup (two steps to start learning)
+## Setup (for first-time skill installation)
 
-**Step 1 — One-click install:**
-- Windows: Double-click `setup.bat`
-- macOS/Linux: `bash setup.sh`
+The user only needs to run `setup.bat` (Windows) or `bash setup.sh` (macOS/Linux) once.
+This installs Python dependencies and authenticates with Google.
 
-**Step 2 — Add your book:**
-```bash
-py -3 scripts/nlm_add_book.py "path/to/your/book.pdf"
-```
+After that, everything is handled by Claude:
 
-This single command: compresses the PDF (if needed), creates a NotebookLM notebook, uploads the file, waits for OCR indexing, and saves the notebook ID. Everything is automatic.
+1. **User drops a PDF** in the current directory
+2. **User says** "我要学这本书" or "我想学《XXX》"
+3. **Claude runs** `nlm_add_book.py` automatically — creates notebook, uploads, waits for OCR
+4. **Done** — user asks questions, Claude queries the correct notebook
 
-**Done.** Start asking Claude questions about your book. The skill auto-detects which notebook to use.
-
-**Verify:** `py -3 scripts/nlm_query.py --health`
-
-To add more books, run the same command with a different PDF.
-To switch between books: `py -3 scripts/nlm_add_book.py --switch "Book Name"`
-To list your books: `py -3 scripts/nlm_add_book.py --list`
+Claude runs these commands internally. The user never types them.
 
 ---
 
