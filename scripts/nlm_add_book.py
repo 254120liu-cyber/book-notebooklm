@@ -99,32 +99,44 @@ def compress_pdf(input_path: str, max_mb: int = COMPRESS_ABOVE_MB) -> str | None
 
 
 def _compress_ghostscript(src: str, dst: str, max_mb: int) -> bool:
-    """Ghostscript /ebook: 150 DPI, near-lossless for text. ~4 min for 500MB.
+    """Ghostscript two-pass: /ebook first (150 DPI, high quality), then /screen
+    if still over limit (72 DPI, more aggressive).
 
-    /ebook gets virtually any book under 200MB. A 478MB scanned book compressed
-    to 171MB (64% reduction) with quality nearly identical to the original.
+    /ebook: 478MB → 171MB (64% reduction), near-lossless, ~4 min
+    /screen: 478MB → 59MB (88% reduction), lower quality, ~7 min
     """
     gs = _find_ghostscript()
     if not gs:
         return False
 
     env = os.environ.copy()
-    env["MSYS_NO_PATHCONV"] = "1"  # Prevent Git Bash path mangling
+    env["MSYS_NO_PATHCONV"] = "1"
 
-    print("  [Engine 1] Ghostscript /ebook (150 DPI)...")
-    try:
-        subprocess.run(
-            [gs, "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
-             "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dQUIET", "-dBATCH",
-             f"-sOutputFile={dst}", src],
-            timeout=600, check=True, env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+    presets = [
+        ("/ebook", "150 DPI, high quality"),
+        ("/screen", "72 DPI, more compression"),
+    ]
 
-    return _check_and_report(dst, max_mb, "Ghostscript /ebook")
+    for preset, desc in presets:
+        print(f"  Ghostscript {preset} ({desc})...")
+        try:
+            subprocess.run(
+                [gs, "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+                 f"-dPDFSETTINGS={preset}", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                 f"-sOutputFile={dst}", src],
+                timeout=600, check=True, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            break
+
+        if _check_and_report(dst, max_mb, f"Ghostscript {preset}"):
+            return True
+        if os.path.exists(dst):
+            os.unlink(dst)
+
+    return False
 
 
 def _find_ghostscript() -> str | None:
