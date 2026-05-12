@@ -140,22 +140,26 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 
 ---
 
-## Setup (one-click)
+## Setup (two steps to start learning)
 
-**Windows:** Double-click `setup.bat` in the skill directory.
-**macOS/Linux:** Run `bash setup.sh` in the skill directory.
+**Step 1 — One-click install:**
+- Windows: Double-click `setup.bat`
+- macOS/Linux: `bash setup.sh`
 
-The setup script installs all dependencies, authenticates with Google, and verifies everything works.
+**Step 2 — Add your book:**
+```bash
+py -3 scripts/nlm_add_book.py "path/to/your/book.pdf"
+```
 
-**Manual setup** (if the script fails):
+This single command: compresses the PDF (if needed), creates a NotebookLM notebook, uploads the file, waits for OCR indexing, and saves the notebook ID. Everything is automatic.
 
-1. Install Python deps: `pip install notebooklm-py httpx PyPDF2`
-2. Install browser: `playwright install chromium`
-3. Login: `notebooklm login --browser msedge`
-4. Create a notebook at https://notebooklm.google.com and upload your book PDF
-5. Set notebook ID: `export NOTEBOOKLM_DEFAULT_NB="your_id"` (or `set` on Windows)
+**Done.** Start asking Claude questions about your book. The skill auto-detects which notebook to use.
 
 **Verify:** `py -3 scripts/nlm_query.py --health`
+
+To add more books, run the same command with a different PDF.
+To switch between books: `py -3 scripts/nlm_add_book.py --switch "Book Name"`
+To list your books: `py -3 scripts/nlm_add_book.py --list`
 
 ---
 

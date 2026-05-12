@@ -42,10 +42,62 @@ if not _NLM_EXE:
             _NLM_EXE = c
             break
 
-DEFAULT_NOTEBOOK = os.environ.get("NOTEBOOKLM_DEFAULT_NB", "51429604")
 AUTHUSER = os.environ.get("NOTEBOOKLM_AUTHUSER", "0")
-STORAGE_STATE = os.path.expanduser(r"~\.notebooklm\profiles\default\storage_state.json")
+
+BOOK_MAP_FILE = os.path.expanduser(r"~\.notebooklm\book_map.json")
 STATE_DIR = os.path.expanduser(r"~\.notebooklm\profiles\default")
+
+
+def _load_book_map() -> dict:
+    if os.path.exists(BOOK_MAP_FILE):
+        try:
+            with open(BOOK_MAP_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _resolve_default_notebook() -> str:
+    """Determine which notebook to use, in priority order:
+    1. NOTEBOOKLM_DEFAULT_NB environment variable (explicit override)
+    2. Active book from ~/.notebooklm/profiles/default/active_book.json
+    3. First entry in ~/.notebooklm/book_map.json
+    4. Hardcoded fallback
+    """
+    env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
+    if env_val:
+        return env_val
+
+    # Check active_book.json
+    active_file = os.path.join(STATE_DIR, "active_book.json")
+    if os.path.exists(active_file):
+        try:
+            with open(active_file, "r", encoding="utf-8") as f:
+                active = json.load(f)
+            name = active.get("name")
+            if name:
+                book_map = _load_book_map()
+                info = book_map.get(name, {})
+                nb_id = info.get("notebook_id")
+                if nb_id:
+                    return nb_id
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # First entry in book map
+    book_map = _load_book_map()
+    if book_map:
+        first = next(iter(book_map.values()))
+        nb_id = first.get("notebook_id")
+        if nb_id:
+            return nb_id
+
+    return "51429604"
+
+
+DEFAULT_NOTEBOOK = _resolve_default_notebook()
+STORAGE_STATE = os.path.expanduser(r"~\.notebooklm\profiles\default\storage_state.json")
 STATE_FILE = os.path.join(STATE_DIR, "nlm_state.json")
 CACHE_DIR = os.path.join(STATE_DIR, "cache")
 
