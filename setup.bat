@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [1/4] Installing Python dependencies...
-py -3 -m pip install notebooklm-py httpx PyPDF2 --quiet
+py -3 -m pip install notebooklm-py httpx PyPDF2 PyMuPDF Pillow --quiet
 if %errorlevel% neq 0 (
     echo [WARN] pip install had issues. Try running manually:
     echo   py -3 -m pip install notebooklm-py httpx PyPDF2
