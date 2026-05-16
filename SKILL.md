@@ -89,13 +89,26 @@ When NotebookLM provides page numbers, always include them in your response. Thi
 
 If NotebookLM's first answer is too vague, too short, or misses the point, query again with a more specific or rephrased question BEFORE responding to the user. Don't waste the user's time with an incomplete answer.
 
-### R7: Conversation continuity — never start fresh
+### R7: Expand and elaborate — NotebookLM answers are too brief
+
+NotebookLM's answers are inherently concise — it gives the definition and key points, but lacks depth, examples, and intuition. After receiving a NotebookLM answer, Claude MUST expand significantly:
+
+1. **Add concrete examples** — code snippets, real assembly, actual values. Abstract concepts need concrete anchors.
+2. **Explain the WHY** — not just what something is, but why it exists, what problem it solves.
+3. **Connect to prior learning** — link back to concepts the user already understands.
+4. **Use visual descriptions** — memory layouts, execution flows, comparison tables.
+5. **Explain each step** — when showing assembly or code, annotate every line, don't assume the user knows what each instruction does.
+6. **Preempt confusion** — if a term or concept was confusing before, address it proactively.
+
+The NotebookLM answer is the skeleton. Claude adds the meat.
+
+### R8: Conversation continuity — never start fresh
 
 Always resume the same NotebookLM conversation. The wrapper handles this automatically — do NOT pass `--new` or start a fresh conversation. NotebookLM builds context across queries in the same conversation, so later answers are more informed and coherent.
 
 **Why:** Restarting the conversation loses all accumulated context about what the user has been learning. This degrades answer quality and wastes the user's uploaded source material's context window.
 
-### R8: Pre-session warmup
+### R9: Pre-session warmup
 
 When starting a learning session, proactively verify the pipeline is healthy:
 
@@ -106,7 +119,7 @@ py -3 scripts/nlm_query.py --warmup   # Ensure regional cookies are fresh
 
 Do this at the start of each session so the user never hits auth failures mid-learning. If status shows "EXPIRED", run `--relogin` silently before the user asks their first question.
 
-### R9: Chapter coverage awareness
+### R10: Chapter coverage awareness
 
 NotebookLM may not index the entire book. Always parse its answer for signals like "外部知识", "不在源文件中", or "非源文件正文内容". When detected:
 1. Tell the user clearly that this answer is NOT from the book
@@ -116,13 +129,13 @@ NotebookLM may not index the entire book. Always parse its answer for signals li
 
 This is critical — users may assume all answers come from the book unless you explicitly flag otherwise.
 
-### R10: Deduplicate queries
+### R11: Deduplicate queries
 
 If the user repeats a question that was already answered by NotebookLM within the same session, do NOT query NotebookLM again. Instead, reference the previous answer. This avoids redundant API calls and respects rate limits.
 
 Track which questions have been asked in the current conversation context. If unsure whether a question is a repeat, compare it against recent queries before deciding.
 
-### R11: Diagnose before reporting errors
+### R12: Diagnose before reporting errors
 
 If NotebookLM returns an abnormal response (empty, timeout, abnormally short), run diagnostics before presenting the result to the user:
 
@@ -133,7 +146,7 @@ If NotebookLM returns an abnormal response (empty, timeout, abnormally short), r
 
 Don't just pass an unexplained error to the user.
 
-### R12: Multi-book readiness
+### R13: Multi-book readiness
 
 When the user starts studying a new book:
 1. Help them create a new NotebookLM notebook
