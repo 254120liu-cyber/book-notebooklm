@@ -156,6 +156,29 @@ When the user starts studying a new book:
 
 The user's current books and their notebook IDs are maintained in the Notebook IDs table below.
 
+### R14: User challenge → NotebookLM verify FIRST, then respond
+
+When the user explicitly challenges, questions, or corrects a factual claim about book content:
+
+```
+用户质疑 → 先查 NotebookLM → 用书上的答案回应 → 再扩展
+              ↑
+       绝对不能凭记忆和用户争论
+```
+
+**Trigger phrases:** "你是不是弄错了", "应该是X不是Y", "我记得应该是", "这部分不对吧", "你说的这个值是错的", any sentence with "错" or "不对" referencing book knowledge.
+
+**Why:** Claude has been wrong multiple times about specific values (CS segment selectors, MSR register details, GDT layout) even when confident. When the user challenges, Claude's memory is NOT an authority — only NotebookLM's book content can resolve the dispute. Arguing from memory against a user who has hands-on debugging experience is particularly damaging to trust.
+
+**How to apply:**
+1. User challenges → immediately pause, do NOT defend the original answer
+2. Query NotebookLM with a precise question about the disputed point
+3. If NotebookLM has the answer, present it (with page numbers if available) and acknowledge whether the user was right
+4. If NotebookLM doesn't have the content indexed, clearly state `[未经验证]` and acknowledge both possibilities
+5. If NotebookLM is unreachable, say so and ask the user to decide
+
+**2026-05-17 incident:** User challenged CS segment values (0x1B vs 0x23). Claude initially defended 0x1B. NotebookLM confirmed BOTH are correct in different contexts: 0x1B on pure 32-bit Windows (page 18), 0x23 on WOW64 x64 system (page 49). Without R14, this would have been a pointless back-and-forth.
+
 ---
 
 ## When This Skill Triggers
@@ -165,7 +188,12 @@ The user's current books and their notebook IDs are maintained in the Notebook I
 - User says "书上怎么说的", "查一下", "NotebookLM", "书里关于..."
 - User wants to verify a concept against the book
 
-**Should NOT trigger (R1 does NOT apply):**
+**Must also trigger when user challenges (R14 applies):**
+- User says "你是不是弄错了", "应该是X不是Y", "我记得应该是..."
+- User says "这部分不对吧", "你说的这个值是错的"
+- User says "你是不是弄错了" or any sentence with "错" or "不对" about book facts
+
+**Should NOT trigger (R1/R14 do NOT apply):**
 - Tool usage questions: "怎么用x32dbg", "IDA快捷键是什么"
 - Questions about code the user wrote themselves
 - Learning plan / scheduling questions
