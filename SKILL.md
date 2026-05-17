@@ -156,7 +156,22 @@ When the user starts studying a new book:
 
 The user's current books and their notebook IDs are maintained in the Notebook IDs table below.
 
-### R14: User challenge → NotebookLM verify FIRST, then respond
+### R14: Re-upload = delete all old, use only the new
+
+When a new/better PDF gets uploaded to NotebookLM for the same book:
+1. Create a NEW notebook for the new PDF
+2. Remove ALL old notebook entries for the same book from `book_map.json`
+3. Set the new notebook as the active book
+4. Never keep two versions of the same book in NotebookLM
+
+**Why:** Old notebooks contain incomplete/partial PDFs that cause NotebookLM to return "[仅涵盖至第166页]" errors. Keeping them causes confusion about which notebook to query.
+
+**How to apply:**
+1. User drops a new PDF for an existing book → run `nlm_add_book.py` with the new PDF
+2. After new notebook is created and indexed, delete old notebook entries from `book_map.json`
+3. Only the latest upload should exist as an active notebook
+
+### R15: User challenge → NotebookLM verify FIRST, then respond
 
 When the user explicitly challenges, questions, or corrects a factual claim about book content:
 
@@ -176,6 +191,8 @@ When the user explicitly challenges, questions, or corrects a factual claim abou
 3. If NotebookLM has the answer, present it (with page numbers if available) and acknowledge whether the user was right
 4. If NotebookLM doesn't have the content indexed, clearly state `[未经验证]` and acknowledge both possibilities
 5. If NotebookLM is unreachable, say so and ask the user to decide
+
+**2026-05-17 incident:** User challenged CS segment values (0x1B vs 0x23). Claude initially defended 0x1B. NotebookLM confirmed BOTH are correct in different contexts: 0x1B on pure 32-bit Windows (page 18), 0x23 on WOW64 x64 system (page 49). Without this rule, this would have been a pointless back-and-forth.
 
 **2026-05-17 incident:** User challenged CS segment values (0x1B vs 0x23). Claude initially defended 0x1B. NotebookLM confirmed BOTH are correct in different contexts: 0x1B on pure 32-bit Windows (page 18), 0x23 on WOW64 x64 system (page 49). Without R14, this would have been a pointless back-and-forth.
 
