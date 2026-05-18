@@ -577,12 +577,13 @@ def _check_and_report(path: str, max_mb: int, engine_name: str) -> bool:
 
 async def create_and_upload_all(
     split_pdfs: list[str], book_name: str, wait_for_ocr: bool = True,
-    ocr_timeout: int = 300,
-) -> tuple[str, str, list]:
-    """Create notebook + upload all split PDFs. Returns (nb_id, title, sources).
+    ocr_timeout: int = 600,
+) -> tuple[str, str, list, bool]:
+    """Create notebook + upload all split PDFs. Returns (nb_id, title, sources, all_ready).
 
-    All sources must pass OCR before returning. Sources that timeout get
-    one retry; if still failing, report to user but don't block the notebook.
+    CRITICAL: ALL sources must pass OCR before all_ready=True.
+    If any source fails OCR after retries, the notebook is NOT marked ready
+    and the caller should NOT activate this notebook.
     """
     from notebooklm import NotebookLMClient
 
@@ -590,29 +591,34 @@ async def create_and_upload_all(
     async with await NotebookLMClient.from_storage() as client:
         notebook = await client.notebooks.create(book_name)
         nb_id = notebook.id
+        full_nb_id = nb_id  # keep full ID for source operations
         print(f"  Created: {nb_id}")
 
         # ── Upload phase ──
         sources = []
+        upload_errors = []
         for i, pdf_path in enumerate(split_pdfs):
             fname = os.path.basename(pdf_path)
             size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
             print(f"[2/3] Uploading [{i+1}/{len(split_pdfs)}] {fname} ({size_mb:.0f}MB)...")
             try:
-                source = await client.sources.add_file(nb_id, pdf_path, wait=False)
+                source = await client.sources.add_file(full_nb_id, pdf_path, wait=False)
                 sources.append(source)
                 print(f"  ✓ Uploaded: {source.id}")
             except Exception as e:
                 print(f"  ✗ Upload failed: {e}")
-                continue
+                upload_errors.append(fname)
+
+        if not sources:
+            return nb_id.split("-")[0], notebook.title, [], False
 
         if not wait_for_ocr:
-            return nb_id.split("-")[0], notebook.title, sources
+            return nb_id.split("-")[0], notebook.title, sources, False
 
-        # ── OCR phase: wait for ALL sources, with retry ──
-        print(f"\n[3/3] OCR indexing {len(sources)} sources (timeout={ocr_timeout}s each)...")
-        ocr_ok = 0
-        ocr_pending = 0
+        # ── OCR phase: ALL must succeed ──
+        print(f"\n[3/3] OCR indexing {len(sources)} sources "
+              f"(timeout={ocr_timeout}s, max 3 retries each)...")
+        ocr_ready = []
         ocr_failed = []
 
         for i, source in enumerate(sources):
@@ -620,36 +626,41 @@ async def create_and_upload_all(
             print(f"  [{i+1}/{len(sources)}] {fname[:50]}...")
 
             ok = False
-            for attempt in range(2):  # 2 attempts
+            for attempt in range(3):
                 try:
-                    source = await client.sources.wait_until_ready(
-                        nb_id, source.id, timeout=ocr_timeout
+                    src = await client.sources.wait_until_ready(
+                        full_nb_id, source.id, timeout=ocr_timeout
                     )
                     ok = True
                     break
                 except Exception as e:
-                    if attempt == 0:
-                        print(f"    Retry {attempt+1}: {e}")
-                        await asyncio.sleep(3)
+                    wait_s = 5 * (attempt + 1)
+                    if attempt < 2:
+                        print(f"    Retry {attempt+1} in {wait_s}s: {str(e)[:80]}")
+                        await asyncio.sleep(wait_s)
                     else:
-                        print(f"    OCR failed after 2 attempts: {e}")
+                        print(f"    ✗ OCR failed after 3 attempts: {str(e)[:120]}")
 
             if ok:
                 print(f"    ✓ OCR ready")
-                ocr_ok += 1
+                ocr_ready.append(fname)
             else:
                 ocr_failed.append(fname)
-                print(f"    ⚠ OCR pending (indexing continues in background)")
 
-        if ocr_failed:
-            print(f"\n  ⚠ {len(ocr_failed)}/{len(sources)} sources still indexing:")
-            for f in ocr_failed:
-                print(f"      - {f}")
-            print(f"  The notebook is usable; these may become available later.")
+        all_ready = len(ocr_failed) == 0
 
-        print(f"\n  OCR: {ocr_ok} ready, {len(ocr_failed)} pending, {len(sources)} total")
+        if not all_ready:
+            print(f"\n  ✗ OCR INCOMPLETE: {len(ocr_ready)}/{len(sources)} ready, "
+                  f"{len(ocr_failed)} failed")
+            for fname in ocr_failed:
+                print(f"      FIX: try re-uploading '{fname}' as smaller chunks")
+            if upload_errors:
+                print(f"  Upload errors: {len(upload_errors)}")
+            print(f"  Notebook {nb_id.split('-')[0]} NOT marked as ready.")
+        else:
+            print(f"\n  ✓ ALL {len(ocr_ready)}/{len(sources)} sources OCR-ready")
 
-    return nb_id.split("-")[0], notebook.title, sources
+    return nb_id.split("-")[0], notebook.title, sources, all_ready
 
 
 async def delete_notebook_completely(nb_id: str) -> bool:
@@ -832,8 +843,9 @@ def main():
             split_pdfs = [upload_path]
 
     # Step 2-3: Create notebook + upload all
+    all_ready = False
     try:
-        nb_id, title, sources = asyncio.run(create_and_upload_all(
+        nb_id, title, sources, all_ready = asyncio.run(create_and_upload_all(
             split_pdfs, book_name, wait_for_ocr=not args.no_wait
         ))
     except Exception as e:
@@ -851,7 +863,16 @@ def main():
             except OSError:
                 pass
 
-    # Step 4: Clean up old notebooks
+    if not all_ready:
+        print(f"\n{'=' * 60}")
+        print(f"  ✗ Book \"{book_name}\" setup incomplete.")
+        print(f"  Notebook {nb_id} exists but some sources failed OCR.")
+        print(f"  Check the errors above and fix before retrying.")
+        print(f"  Old notebooks NOT cleaned (new one not fully ready).")
+        print(f"{'=' * 60}")
+        return 1
+
+    # Step 4: Only when ALL sources OCR-ready → clean old + activate
     cleanup_old_notebooks(book_name, nb_id)
 
     # Step 5: Save mapping
@@ -860,7 +881,7 @@ def main():
         "notebook_id": nb_id,
         "title": title,
         "pdf_path": pdf_path,
-        "split_sources": len(split_pdfs) if split_pdfs else 1,
+        "split_sources": len(split_pdfs) if isinstance(split_pdfs, list) else 1,
         "total_pages": total_pages,
         "added_at": time.strftime("%Y-%m-%d %H:%M"),
     }
