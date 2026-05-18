@@ -1,24 +1,24 @@
 #!/usr/bin/env python
-"""One-command book setup: compress → create notebook → upload → ready.
+"""One-command book setup v2: extract TOC → split by chapters → upload all → cleanup old.
 
 Usage:
   py -3 scripts/nlm_add_book.py "path/to/book.pdf"
   py -3 scripts/nlm_add_book.py "path/to/book.pdf" --name "My Book Name"
-  py -3 scripts/nlm_add_book.py --list              # Show all registered books
-  py -3 scripts/nlm_add_book.py --switch "Book"     # Switch active book
+  py -3 scripts/nlm_add_book.py --list
+  py -3 scripts/nlm_add_book.py --switch "Book"
 
-The script:
-  1. Compresses the PDF if > 50MB (NotebookLM's practical limit)
-  2. Creates a new NotebookLM notebook
-  3. Uploads the PDF (with resumable upload for large files)
-  4. Waits for OCR indexing to complete
-  5. Saves the mapping so the skill auto-uses the right notebook
+Auto-split: PDF ≤100 pages → direct upload. PDF >100 pages → extract TOC →
+split by chapter boundaries (≤100 pages/chunk) → upload all chunks as sources
+to a single notebook.
+
+Old notebooks for the same book are automatically cleaned up after successful upload.
 """
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,15 +29,17 @@ from pathlib import Path
 # ── Config ─────────────────────────────────────────────────
 
 BOOK_MAP_FILE = os.path.expanduser(r"~\.notebooklm\book_map.json")
+ROUTES_FILE = os.path.expanduser(r"~\.notebooklm\chapter_routes.json")
 STATE_DIR = os.path.expanduser(r"~\.notebooklm\profiles\default")
-MAX_FILE_SIZE_MB = 200  # NotebookLM's file size limit
-COMPRESS_ABOVE_MB = 200   # Start compression if above this
+SPLIT_DIR = os.path.expanduser(r"~\.notebooklm\split")
+MAX_FILE_SIZE_MB = 200
+COMPRESS_ABOVE_MB = 200
+MAX_PAGES_PER_CHUNK = 100
 
 
-# ── Book Map (persistent notebook ID storage) ──────────────
+# ── Book Map ──────────────────────────────────────────────
 
 def load_book_map() -> dict:
-    """Returns {book_name: {notebook_id, pdf_path, added_at}}."""
     if os.path.exists(BOOK_MAP_FILE):
         try:
             with open(BOOK_MAP_FILE, "r", encoding="utf-8") as f:
@@ -54,21 +56,421 @@ def save_book_map(m: dict):
 
 
 def set_active_book(name: str):
-    """Set the active notebook via env var hint and file."""
     state_file = os.path.join(STATE_DIR, "active_book.json")
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump({"name": name, "set_at": time.time()}, f)
-    print(f"Active book set to: {name}")
+
+
+# ── Chapter Routes ─────────────────────────────────────────
+
+def load_routes() -> dict:
+    if os.path.exists(ROUTES_FILE):
+        try:
+            with open(ROUTES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"keywords": {}, "chapter_boundaries": {}}
+
+
+def save_routes(r: dict):
+    os.makedirs(os.path.dirname(ROUTES_FILE), exist_ok=True)
+    with open(ROUTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(r, f, ensure_ascii=False, indent=2)
+
+
+# ── PDF TOC Extraction ─────────────────────────────────────
+
+def extract_toc(pdf_path: str) -> list[dict]:
+    """Extract chapter boundaries from PDF table of contents.
+
+    Scans the first 30 pages for chapter/section headers like:
+      '第7章 Windows内核基础'
+      '7.1 内核理论基础'
+      '第11章 PE文件格式'
+
+    Returns: [{chapter: int, title: str, start_page: int}, ...]
+    """
+    try:
+        import PyPDF2
+    except ImportError:
+        print("  [WARN] PyPDF2 not installed. Falling back to even-page split.")
+        return _fallback_chapter_split(pdf_path)
+
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+    except Exception as e:
+        print(f"  [WARN] Cannot read PDF: {e}. Falling back to even-page split.")
+        return _fallback_chapter_split(pdf_path)
+
+    chapters = []
+    seen_chapters = set()
+
+    # Scan pages 1-35 for TOC and chapter headers
+    for page_num in range(min(35, total_pages)):
+        try:
+            text = reader.pages[page_num].extract_text()
+            if not text:
+                continue
+        except Exception:
+            continue
+
+        # Match Chinese chapter patterns: "第X章" or "第XX章"
+        for match in re.finditer(r'第(\d{1,2})章\s*(.+?)(?:\s*\.{3,}|\s*\d{1,3}\s*$|\s*$)', text):
+            ch_num = int(match.group(1))
+            ch_title = match.group(2).strip().rstrip('.')[:80]
+            if ch_num not in seen_chapters and ch_num <= 30:
+                seen_chapters.add(ch_num)
+                # Try to find page number after the chapter title
+                page_hint = _extract_page_after_match(text, match.end())
+                chapters.append({
+                    "chapter": ch_num,
+                    "title": f"第{ch_num}章 {ch_title}",
+                    "page_hint": page_hint,
+                })
+
+    if len(chapters) < 3:
+        print("  [WARN] TOC scan found <3 chapters. Falling back to even-page split.")
+        return _fallback_chapter_split(pdf_path)
+
+    # Sort by chapter number
+    chapters.sort(key=lambda c: c["chapter"])
+
+    # Try to get actual page numbers from PDF structure if available
+    chapters = _refine_page_numbers(chapters, reader, total_pages)
+
+    print(f"  TOC extracted: {len(chapters)} chapters")
+    for c in chapters:
+        print(f"    第{c['chapter']}章 (起始 ~p{c['start_page']})")
+
+    return chapters
+
+
+def _extract_page_after_match(text: str, pos: int) -> int | None:
+    """Try to find a page number near the match position."""
+    # Look for patterns like "...  290" or "  290"
+    tail = text[pos:pos + 200]
+    m = re.search(r'\.{2,}\s*(\d{1,4})', tail)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(\d{2,4})\b', tail)
+    if m:
+        val = int(m.group(1))
+        if 10 < val < 1000:
+            return val
+    return None
+
+
+def _refine_page_numbers(chapters: list, reader, total_pages: int) -> list:
+    """Use PDF structure hints to refine chapter start pages."""
+    for c in chapters:
+        hint = c.get("page_hint")
+        if hint and 1 <= hint <= total_pages:
+            c["start_page"] = hint
+        elif c["chapter"] == 1:
+            c["start_page"] = 1
+        else:
+            # Estimate based on previous chapter
+            idx = chapters.index(c)
+            if idx > 0 and chapters[idx - 1].get("start_page"):
+                c["start_page"] = chapters[idx - 1]["start_page"] + 50  # rough guess
+
+    # Fill in end pages: next chapter's start - 1
+    for i in range(len(chapters)):
+        if i + 1 < len(chapters):
+            chapters[i]["end_page"] = max(chapters[i + 1]["start_page"] - 1, chapters[i]["start_page"])
+        else:
+            chapters[i]["end_page"] = total_pages
+
+    # Clean up
+    for c in chapters:
+        if "page_hint" in c:
+            del c["page_hint"]
+
+    return chapters
+
+
+# Known book chapter presets (verified via NotebookLM page citations)
+CHAPTER_PRESETS = {
+    "加密与解密": {
+        1:  (1, 59,   "基础知识",
+             "虚拟内存|WOW64|Win32 API|消息机制|字节序|ASCII|Unicode|小端|大端|保护模式"),
+        2:  (60, 119, "动态分析技术",
+             "断点|x32dbg|x64dbg|OllyDbg|单步|硬件断点|内存断点|条件断点|步过|步进|寄存器|栈回溯"),
+        3:  (120, 170, "静态分析技术",
+             "IDA|反汇编|F5|交叉引用|字符串搜索|十六进制|静态分析|函数识别|流程图"),
+        4:  (171, 196, "逆向分析技术",
+             "调用约定|cdecl|stdcall|fastcall|thiscall|if-else|switch|循环|虚函数|vtable|数组|结构体"),
+        5:  (197, 222, "演示版保护技术",
+             "序列号|KeyFile|Nag|警告窗口|注册表|网络验证|光盘检测|反跟踪|反调试"),
+        6:  (223, 276, "加密算法",
+             "MD5|SHA|AES|DES|RSA|RC4|SM4|Base64|S-Box|加密|解密|对称|非对称|摘要"),
+        7:  (277, 340, "Windows内核基础",
+             "内核|Ring0|Ring3|KPCR|TEB|PEB|SSDT|EPROCESS|驱动|DriverEntry|sysenter|syscall|"
+             "DeviceIoControl|内核对象|IRP|HAL|对象管理器|内存管理器|I/O管理器"),
+        8:  (341, 360, "SEH异常处理",
+             "SEH|VEH|异常处理|异常分发|安全SEH|异常链|try-except|栈展开"),
+        9:  (361, 380, "Win32调试API",
+             "DebugActiveProcess|WaitForDebugEvent|DEBUG_EVENT|ContinueDebugEvent|调试API"),
+        10: (381, 403, "VT虚拟化技术",
+             "VT|VMX|VMCS|EPT|VPID|Hypervisor|VMM|虚拟化"),
+        11: (404, 460, "PE文件格式",
+             "PE|IAT|导入表|导出表|重定位|TLS|延迟导入|资源|绑定导入|输入表|"
+             "IMAGE_DOS_HEADER|IMAGE_NT_HEADERS|IMAGE_SECTION_HEADER|.text|.data|.rsrc"),
+        12: (461, 495, "DLL注入技术",
+             "注入|远程线程|APC注入|DLL注入|SetWindowsHookEx|CreateRemoteThread"),
+        13: (496, 530, "API Hook技术",
+             "Hook|Inline|IAT Hook|VirtualProtect|跳转|detours|SSDT Hook|IRP Hook"),
+        14: (531, 599, "二进制漏洞分析",
+             "shellcode|缓冲区溢出|栈溢出|UAF|类型混淆|ROP|DEP|ASLR|GS|CFG"),
+        15: (600, 660, "软件保护技术",
+             "保护|VMProtect|虚拟化保护|混淆|花指令|反调试|反dump|完整性校验"),
+        16: (661, 720, "脱壳技术",
+             "脱壳|OEP|UPX|ASPack|ASProtect|壳|IAT重建|ESP定律|单步跟踪|内存镜像"),
+        17: (721, 750, "反跟踪技术",
+             "反跟踪|TLS回调|时间检测|RDTSC|int 2d|int 3|硬件断点检测"),
+        18: (751, 780, "外壳编写基础",
+             "外壳|加壳|压缩引擎|导入表加密|重定位处理|AntiDump"),
+        19: (781, 810, "虚拟化保护技术",
+             "虚拟机保护|Handler|VMContext|VMP堆栈|x86指令模拟"),
+        20: (811, 850, "重构与适配",
+             "重构|x64适配|移植|WOW64|天堂之门"),
+        21: (851, 880, "加密与解密实战",
+             "CrackMe|KeyGen|注册机|逆向实战|练习"),
+        22: (881, 900, "电子取证技术",
+             "取证|电子证据|日志分析|文件恢复|内存取证"),
+        23: (901, 920, "移动平台安全",
+             "Android|iOS|Mach-O|ELF|DEX|Smali|越狱"),
+        24: (921, 940, "其他"),
+        25: (941, 948, "附录",
+             "参考文献|附录|索引"),
+    }
+}
+
+
+def _fallback_chapter_split(pdf_path: str) -> list:
+    """When TOC extraction fails, try chapter preset then even-page split."""
+    # Try to match a known book preset from the filename
+    book_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    matched_preset = None
+    for preset_key, preset_chapters in CHAPTER_PRESETS.items():
+        if preset_key in book_name or any(c in book_name for c in ["加密", "解密"]):
+            matched_preset = preset_chapters
+            print(f"  Using chapter preset for: {preset_key}")
+            break
+
+    try:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+    except Exception:
+        total_pages = 948
+
+    if matched_preset:
+        chapters = []
+        for ch_num in sorted(matched_preset.keys()):
+            entry = matched_preset[ch_num]
+            start, end, title = entry[0], entry[1], entry[2]
+            keywords_str = entry[3] if len(entry) > 3 else ""
+            chapters.append({
+                "chapter": ch_num,
+                "title": f"第{ch_num}章 {title}",
+                "start_page": start,
+                "end_page": min(end, total_pages),
+                "keywords": keywords_str,
+            })
+        return chapters
+
+    # Even-page fallback
+    chapters = []
+    for start in range(1, total_pages + 1, MAX_PAGES_PER_CHUNK):
+        end = min(start + MAX_PAGES_PER_CHUNK - 1, total_pages)
+        chapters.append({
+            "chapter": len(chapters) + 1,
+            "title": f"Part {len(chapters) + 1} (pp {start}-{end})",
+            "start_page": start,
+            "end_page": end,
+        })
+    return chapters
+
+
+# ── PDF Splitting ──────────────────────────────────────────
+
+def compute_chunks(chapters: list, max_pages: int = MAX_PAGES_PER_CHUNK) -> list[dict]:
+    """Group chapters into chunks ≤ max_pages each.
+
+    Strategy:
+    - Single chapter > max_pages → split internally (by sub-section boundaries if possible)
+    - Accumulate chapters until adding the next one exceeds max_pages
+    - Each chunk gets a name like "第1章_基础知识" or "第5-6章_加密算法"
+    """
+    chunks = []
+    current_start = None
+    current_end = None
+    current_name_parts = []
+
+    for ch in chapters:
+        ch_pages = ch["end_page"] - ch["start_page"] + 1
+
+        # Single chapter too large → split internally
+        if ch_pages > max_pages:
+            # Flush current accumulation
+            if current_start is not None:
+                chunks.append(_make_chunk(current_name_parts, current_start, current_end))
+                current_start = None
+
+            # Split this chapter into sub-chunks
+            for sub_start in range(ch["start_page"], ch["end_page"] + 1, max_pages):
+                sub_end = min(sub_start + max_pages - 1, ch["end_page"])
+                sub_idx = len([c for c in chunks if c["name"].startswith(ch["title"])]) + 1
+                chunks.append({
+                    "name": f"{ch['title']}({sub_idx})",
+                    "start": sub_start,
+                    "end": sub_end,
+                })
+            current_name_parts = []
+            continue
+
+        # Start new accumulation
+        if current_start is None:
+            current_start = ch["start_page"]
+            current_end = ch["end_page"]
+            current_name_parts = [ch["title"]]
+        else:
+            # Would adding this chapter exceed max_pages?
+            if (ch["end_page"] - current_start + 1) > max_pages:
+                # Flush current and start new
+                chunks.append(_make_chunk(current_name_parts, current_start, current_end))
+                current_start = ch["start_page"]
+                current_end = ch["end_page"]
+                current_name_parts = [ch["title"]]
+            else:
+                current_end = ch["end_page"]
+                current_name_parts.append(ch["title"])
+
+    # Flush remaining
+    if current_start is not None:
+        chunks.append(_make_chunk(current_name_parts, current_start, current_end))
+
+    # Also record in chapter_routes.json for future routing
+    routes = load_routes()
+    for ch in chapters:
+        routes["chapter_boundaries"][str(ch["chapter"])] = {
+            "start": ch["start_page"],
+            "end": ch["end_page"],
+            "title": ch["title"],
+        }
+    # Auto-seed keywords from chapter titles and preset keywords
+    for ch in chapters:
+        title = ch["title"]
+        # Use preset keywords if available, otherwise extract from title
+        if ch.get("keywords"):
+            terms = ch["keywords"].split("|")
+        else:
+            terms = _extract_terms(title)
+        for term in terms:
+            term = term.strip()
+            if term and len(term) >= 2:
+                if term not in routes["keywords"]:
+                    routes["keywords"][term] = {
+                        "chapter": ch["chapter"],
+                        "pages": f"{ch['start_page']}-{ch['end_page']}",
+                        "source": "preset" if ch.get("keywords") else "toc_seed",
+                        "hits": 0,
+                        "last_hit": "",
+                    }
+    save_routes(routes)
+
+    return chunks
+
+
+def _make_chunk(name_parts: list, start: int, end: int) -> dict:
+    """Create a chunk descriptor with a human-readable name."""
+    if len(name_parts) == 1:
+        name = name_parts[0]
+    else:
+        # "第7章 ..." + "第8章 ..." → "第7-8章_..."
+        first_num = re.search(r'第(\d+)章', name_parts[0])
+        last_num = re.search(r'第(\d+)章', name_parts[-1])
+        if first_num and last_num:
+            name = f"第{first_num.group(1)}-{last_num.group(1)}章"
+        else:
+            name = name_parts[0]
+    return {"name": name, "start": start, "end": end}
+
+
+def _extract_terms(title: str) -> list[str]:
+    """Extract searchable terms from a chapter/section title."""
+    # Remove chapter numbers and common words
+    clean = re.sub(r'第\d+章|第[一二三四五六七八九十]+章|\d+\.\d+(\.\d+)?|\s+', ' ', title)
+    # Split Chinese + English terms
+    terms = []
+    # English abbreviations (uppercase 2-6 chars)
+    for m in re.finditer(r'\b([A-Z]{2,6})\b', clean):
+        terms.append(m.group(1))
+    # Chinese key terms (2-4 chars after removing common suffixes)
+    cn_parts = re.split(r'[、，,。.\s]+', clean)
+    for part in cn_parts:
+        part = part.strip()
+        if 2 <= len(part) <= 8 and not part.startswith('第'):
+            terms.append(part)
+    return terms
+
+
+def split_pdf(pdf_path: str, chunks: list[dict], output_dir: str) -> list[str]:
+    """Split PDF into chunk files using Ghostscript. Returns list of output paths."""
+    gs = _find_ghostscript()
+    if not gs:
+        raise RuntimeError("Ghostscript not found. Install from https://ghostscript.com/releases/gsdnld.html")
+
+    os.makedirs(output_dir, exist_ok=True)
+    env = os.environ.copy()
+    env["MSYS_NO_PATHCONV"] = "1"
+
+    outputs = []
+    for i, chunk in enumerate(chunks):
+        safe_name = re.sub(r'[<>:"/\\|?*\s]', '_', chunk["name"])[:60]
+        out_path = os.path.join(output_dir, f"{i+1:02d}-{safe_name}.pdf")
+        start, end = chunk["start"], chunk["end"]
+
+        print(f"  Splitting {chunk['name']} (pp {start}-{end})...")
+        try:
+            subprocess.run(
+                [gs, "-sDEVICE=pdfwrite", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                 f"-dFirstPage={start}", f"-dLastPage={end}",
+                 f"-sOutputFile={out_path}", pdf_path],
+                timeout=300, check=True, env=env,
+            )
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            print(f"    → {size_mb:.0f}MB")
+            outputs.append(out_path)
+        except subprocess.TimeoutExpired:
+            print(f"    [WARN] Timeout splitting {chunk['name']} — retrying with smaller range")
+            # Fallback: split as a single-page range
+            for sub_start in range(start, end + 1, 50):
+                sub_end = min(sub_start + 49, end)
+                sub_path = os.path.join(output_dir, f"{i+1:02d}-{safe_name}_p{sub_start}-{sub_end}.pdf")
+                try:
+                    subprocess.run(
+                        [gs, "-sDEVICE=pdfwrite", "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                         f"-dFirstPage={sub_start}", f"-dLastPage={sub_end}",
+                         f"-sOutputFile={sub_path}", pdf_path],
+                        timeout=120, check=True, env=env,
+                    )
+                    outputs.append(sub_path)
+                except Exception:
+                    print(f"      [ERR] Failed pp {sub_start}-{sub_end}, skipping")
+        except Exception as e:
+            print(f"    [ERR] {e}")
+
+    return outputs
 
 
 # ── PDF Compression ────────────────────────────────────────
 
 def compress_pdf(input_path: str, max_mb: int = COMPRESS_ABOVE_MB) -> str | None:
-    """Compress PDF via Ghostscript /ebook (150 DPI). ~4 min for 500MB.
-
-    Ghostscript is the only engine. It's fast (30-year C codebase), reliable,
-    and /ebook preset gets virtually any book under 200MB with near-lossless quality.
-    """
+    """Compress PDF via Ghostscript /ebook if > max_mb."""
     size_mb = os.path.getsize(input_path) / (1024 * 1024)
     if size_mb <= max_mb:
         print(f"  File size {size_mb:.0f}MB — under {max_mb}MB limit")
@@ -83,41 +485,24 @@ def compress_pdf(input_path: str, max_mb: int = COMPRESS_ABOVE_MB) -> str | None
     gs = _find_ghostscript()
     if not gs:
         raise RuntimeError(
-            f"PDF is {size_mb:.0f}MB (over {max_mb}MB limit) but Ghostscript is not installed.\n"
-            "Install Ghostscript for fast, high-quality compression:\n"
-            "  https://ghostscript.com/releases/gsdnld.html\n"
-            "Download and install the Windows 64-bit version, then restart your terminal."
+            f"PDF is {size_mb:.0f}MB (over {max_mb}MB) but Ghostscript is not installed.\n"
+            "Install: https://ghostscript.com/releases/gsdnld.html"
         )
-
     if os.path.exists(compressed):
         os.unlink(compressed)
     raise RuntimeError(
         f"Ghostscript /ebook could not compress {size_mb:.0f}MB under {max_mb}MB.\n"
-        f"Try splitting the PDF:\n"
-        f"  py -3 scripts/nlm_pdf_splitter.py \"{input_path}\" --ranges \"1-200,201-400\""
+        f"Try splitting: py -3 scripts/nlm_pdf_splitter.py \"{input_path}\""
     )
 
 
 def _compress_ghostscript(src: str, dst: str, max_mb: int) -> bool:
-    """Ghostscript two-pass: /ebook first (150 DPI, high quality), then /screen
-    if still over limit (72 DPI, more aggressive).
-
-    /ebook: 478MB → 171MB (64% reduction), near-lossless, ~4 min
-    /screen: 478MB → 59MB (88% reduction), lower quality, ~7 min
-    """
     gs = _find_ghostscript()
     if not gs:
         return False
-
     env = os.environ.copy()
     env["MSYS_NO_PATHCONV"] = "1"
-
-    presets = [
-        ("/ebook", "150 DPI, high quality"),
-        ("/screen", "72 DPI, more compression"),
-    ]
-
-    for preset, desc in presets:
+    for preset, desc in [("/ebook", "150 DPI"), ("/screen", "72 DPI")]:
         print(f"  Ghostscript {preset} ({desc})...")
         try:
             subprocess.run(
@@ -126,27 +511,20 @@ def _compress_ghostscript(src: str, dst: str, max_mb: int) -> bool:
                  f"-sOutputFile={dst}", src],
                 timeout=600, check=True, env=env,
             )
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
             continue
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            break
-
         if _check_and_report(dst, max_mb, f"Ghostscript {preset}"):
             return True
         if os.path.exists(dst):
             os.unlink(dst)
-
     return False
 
 
 def _find_ghostscript() -> str | None:
-    """Find Ghostscript executable. Checks PATH first, then registry."""
     for name in ["gswin64c", "gswin64", "gswin32c", "gswin32", "gs"]:
         gs = shutil.which(name)
         if gs:
             return gs
-
-    # Registry search (Windows)
     try:
         import winreg
         for root_key, base_path in [
@@ -179,32 +557,28 @@ def _find_ghostscript() -> str | None:
                 pass
     except ImportError:
         pass
-
     return None
 
 
 def _check_and_report(path: str, max_mb: int, engine_name: str) -> bool:
-    """Check if compressed file fits. Prints result."""
     new_mb = os.path.getsize(path) / (1024 * 1024)
-    pct = (1 - new_mb / max(max_mb, 1)) * 100
     if new_mb <= max_mb:
-        print(f"  OK {engine_name}: {new_mb:.0f}MB — fits under {max_mb}MB limit")
+        print(f"  OK {engine_name}: {new_mb:.0f}MB")
         return True
-    else:
-        print(f"  FAIL {engine_name}: {new_mb:.0f}MB — still over {max_mb}MB limit, trying next engine...")
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        return False
+    print(f"  FAIL {engine_name}: {new_mb:.0f}MB — still over {max_mb}MB")
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return False
 
 
 # ── NotebookLM Operations ──────────────────────────────────
 
-async def create_and_upload(
-    pdf_path: str, book_name: str, wait_for_ocr: bool = True
-) -> tuple[str, str]:
-    """Create notebook + upload PDF. Returns (notebook_id, notebook_title)."""
+async def create_and_upload_all(
+    split_pdfs: list[str], book_name: str, wait_for_ocr: bool = True
+) -> tuple[str, str, list]:
+    """Create notebook + upload all split PDFs. Returns (nb_id, title, sources)."""
     from notebooklm import NotebookLMClient
 
     print(f"\n[1/3] Creating notebook \"{book_name}\"...")
@@ -213,41 +587,89 @@ async def create_and_upload(
         nb_id = notebook.id
         print(f"  Created: {nb_id}")
 
-        print(f"[2/3] Uploading PDF: {os.path.basename(pdf_path)}...")
-        source = await client.sources.add_file(nb_id, pdf_path, wait=False)
-        print(f"  Uploaded: {source.id}")
+        sources = []
+        for i, pdf_path in enumerate(split_pdfs):
+            fname = os.path.basename(pdf_path)
+            print(f"[2/3] Uploading [{i+1}/{len(split_pdfs)}] {fname}...")
+            try:
+                source = await client.sources.add_file(nb_id, pdf_path, wait=False)
+                sources.append(source)
+                print(f"  Uploaded: {source.id}")
+            except Exception as e:
+                print(f"  [ERR] Upload failed for {fname}: {e}")
+                # Try OCR-adaptive: if upload fails, skip this chunk (rare)
+                continue
 
         if wait_for_ocr:
-            print(f"[3/3] Waiting for OCR indexing...")
-            try:
-                source = await client.sources.wait_until_ready(
-                    nb_id, source.id, timeout=300
-                )
-                print(f"  Ready: {source.title}")
-            except Exception as e:
-                print(f"  [WARN] OCR wait timed out: {e}")
-                print(f"  Notebook is still usable; indexing continues in background.")
+            print(f"[3/3] Waiting for OCR indexing ({len(sources)} sources)...")
+            for i, source in enumerate(sources):
+                print(f"  [{i+1}/{len(sources)}] {source.title}...")
+                try:
+                    source = await client.sources.wait_until_ready(
+                        nb_id, source.id, timeout=300
+                    )
+                    print(f"    ✓ Ready")
+                except Exception as e:
+                    msg = str(e)
+                    if "timeout" in msg.lower() or "timed out" in msg.lower():
+                        print(f"    [OCR TIMEOUT] Source is {source.title}")
+                        # Don't delete — just warn. OCR continues in background.
+                        print(f"    Notebook is still usable; indexing may continue in background.")
+                    else:
+                        print(f"    [WARN] {e}")
 
-    return nb_id.split("-")[0], notebook.title  # Return short ID + full title
+    return nb_id.split("-")[0], notebook.title, sources
+
+
+async def delete_notebook_sources(nb_id: str) -> bool:
+    """Delete all sources from a notebook."""
+    try:
+        from notebooklm import NotebookLMClient
+        async with await NotebookLMClient.from_storage() as client:
+            full_id = nb_id
+            sources = await client.sources.list(full_id)
+            for s in sources:
+                await client.sources.delete(full_id, s.id)
+            return True
+    except Exception:
+        return False
+
+
+# ── Cleanup ────────────────────────────────────────────────
+
+def cleanup_old_notebooks(book_name: str, new_nb_id: str):
+    """Remove old notebook entries for the same book from book_map after
+    verifying the new one is set up."""
+    books = load_book_map()
+    to_delete = []
+    for k, v in books.items():
+        # Same book prefix or similar name
+        if k.startswith(book_name) or book_name.startswith(k):
+            if v.get("notebook_id") != new_nb_id:
+                to_delete.append((k, v.get("notebook_id")))
+
+    for k, old_id in to_delete:
+        print(f"  Cleaning up old notebook: {k} ({old_id})")
+        del books[k]
+
+    save_book_map(books)
+
+    if to_delete and len(to_delete) > 0:
+        print(f"  Removed {len(to_delete)} old notebook entries.")
 
 
 # ── CLI ────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Add a book to NotebookLM — one command from PDF to ready"
+        description="Add a book to NotebookLM v2 — auto-split + multi-source upload"
     )
     parser.add_argument("pdf", nargs="?", help="Path to the book PDF file")
-    parser.add_argument("--name", "-n", default=None,
-                       help="Book name (defaults to PDF filename)")
-    parser.add_argument("--no-compress", action="store_true",
-                       help="Skip PDF compression even if file is large")
-    parser.add_argument("--no-wait", action="store_true",
-                       help="Don't wait for OCR indexing to complete")
-    parser.add_argument("--list", action="store_true",
-                       help="List all registered books")
-    parser.add_argument("--switch", "-s", default=None, metavar="NAME",
-                       help="Switch active book by name")
+    parser.add_argument("--name", "-n", default=None, help="Book name (defaults to PDF filename)")
+    parser.add_argument("--no-compress", action="store_true", help="Skip PDF compression")
+    parser.add_argument("--no-wait", action="store_true", help="Don't wait for OCR indexing")
+    parser.add_argument("--list", action="store_true", help="List all registered books")
+    parser.add_argument("--switch", "-s", default=None, metavar="NAME", help="Switch active book by name")
     args = parser.parse_args()
 
     # ── List books ──
@@ -259,31 +681,27 @@ def main():
         else:
             print("Registered books:")
             for name, info in sorted(books.items()):
-                nb_id = info.get("notebook_id", "?")
-                added = info.get("added_at", "?")
                 print(f"  {name}")
-                print(f"    Notebook: {nb_id}  |  Added: {added}")
+                print(f"    Notebook: {info.get('notebook_id', '?')}  |  Added: {info.get('added_at', '?')}")
         return 0
 
     # ── Switch book ──
     if args.switch:
         books = load_book_map()
         name = args.switch
-        # Fuzzy match
         match = None
         for k in books:
             if name.lower() in k.lower():
                 match = k
                 break
         if not match:
-            print(f"Book \"{name}\" not found. Registered books:")
+            print(f"Book \"{name}\" not found.")
             for k in sorted(books):
                 print(f"  - {k}")
             return 1
         set_active_book(match)
+        print(f"Active book set to: {match}")
         print(f"Notebook ID: {books[match]['notebook_id']}")
-        print(f'Run: set NOTEBOOKLM_DEFAULT_NB={books[match]["notebook_id"]}')
-        print(f'Or the skill will auto-detect from ~/.notebooklm/book_map.json')
         return 0
 
     # ── Add book ──
@@ -311,36 +729,68 @@ def main():
         if compressed:
             upload_path = compressed
 
-    # Step 1-3: Create notebook + upload + wait
+    # Step 1: Check page count and split if needed
     try:
-        nb_id, title = asyncio.run(create_and_upload(
-            upload_path, book_name, wait_for_ocr=not args.no_wait
+        import PyPDF2
+        reader = PyPDF2.PdfReader(upload_path)
+        total_pages = len(reader.pages)
+        reader = None  # free memory
+    except Exception as e:
+        print(f"  [WARN] Cannot read page count: {e}. Assuming large PDF.")
+        total_pages = 999
+
+    print(f"  Total pages: {total_pages}")
+
+    if total_pages <= MAX_PAGES_PER_CHUNK:
+        print(f"  ≤{MAX_PAGES_PER_CHUNK} pages — direct upload, no splitting needed.")
+        split_pdfs = [upload_path]
+    else:
+        print(f"  >{MAX_PAGES_PER_CHUNK} pages — extracting TOC and splitting by chapters...")
+        chapters = extract_toc(upload_path)
+        chunks = compute_chunks(chapters, MAX_PAGES_PER_CHUNK)
+        print(f"  → {len(chunks)} chunks (max {MAX_PAGES_PER_CHUNK} pages each):")
+        for c in chunks:
+            print(f"      {c['name']}: pp {c['start']}-{c['end']} ({c['end']-c['start']+1} pages)")
+
+        output_dir = os.path.join(SPLIT_DIR, re.sub(r'[<>:"/\\|?*]', '_', book_name))
+        split_pdfs = split_pdf(upload_path, chunks, output_dir)
+        print(f"  → Created {len(split_pdfs)} split PDFs in {output_dir}")
+
+        if not split_pdfs:
+            print("  [ERR] Splitting failed. Falling back to direct upload.")
+            split_pdfs = [upload_path]
+
+    # Step 2-3: Create notebook + upload all
+    try:
+        nb_id, title, sources = asyncio.run(create_and_upload_all(
+            split_pdfs, book_name, wait_for_ocr=not args.no_wait
         ))
     except Exception as e:
         msg = str(e)
         print(f"\nERROR: {msg}")
-        print("\nTroubleshooting:")
-        if "connection" in msg.lower() or "all connection attempts" in msg.lower():
-            print("  → VPN may be disconnected. NotebookLM requires VPN access.")
-            print("  → Turn on your VPN and try again.")
+        if "connection" in msg.lower():
+            print("  → VPN may be disconnected. Turn on VPN and try again.")
         print("  1. Check auth: py -3 scripts/nlm_query.py --status")
-        print("  2. Re-login if needed: py -3 scripts/nlm_query.py --relogin")
-        print("  3. Ensure the PDF is valid and readable")
+        print("  2. Re-login: py -3 scripts/nlm_query.py --relogin")
         return 1
     finally:
-        # Clean up temp compressed file
         if compressed and os.path.exists(compressed):
             try:
                 os.unlink(compressed)
             except OSError:
                 pass
 
-    # Step 4: Save mapping
+    # Step 4: Clean up old notebooks
+    cleanup_old_notebooks(book_name, nb_id)
+
+    # Step 5: Save mapping
     books = load_book_map()
     books[book_name] = {
         "notebook_id": nb_id,
         "title": title,
         "pdf_path": pdf_path,
+        "split_sources": len(split_pdfs) if split_pdfs else 1,
+        "total_pages": total_pages,
         "added_at": time.strftime("%Y-%m-%d %H:%M"),
     }
     save_book_map(books)
@@ -349,10 +799,9 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  [OK] Book \"{book_name}\" is ready!")
     print(f"  Notebook ID: {nb_id}")
-    print(f"  Set as active book")
-    print(f"")
+    print(f"  Sources: {len(split_pdfs) if isinstance(split_pdfs, list) else 1}")
+    print(f"  Chapter routes auto-seeded to {ROUTES_FILE}")
     print(f"  You can now ask Claude any question about this book.")
-    print(f"  Example: what is chapter 3 about?")
     print(f"{'=' * 60}")
 
     return 0

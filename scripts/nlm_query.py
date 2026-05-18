@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""NotebookLM Query Wrapper v3 — production-grade book content queries.
+"""NotebookLM Query Wrapper v4 — chapter routing + auto-retry + keyword learning.
 
 Usage:
   nlm_query.py "question"         Query book content
@@ -45,6 +45,7 @@ if not _NLM_EXE:
 AUTHUSER = os.environ.get("NOTEBOOKLM_AUTHUSER", "0")
 
 BOOK_MAP_FILE = os.path.expanduser(r"~\.notebooklm\book_map.json")
+CHAPTER_ROUTES_FILE = os.path.expanduser(r"~\.notebooklm\chapter_routes.json")
 STATE_DIR = os.path.expanduser(r"~\.notebooklm\profiles\default")
 
 
@@ -366,29 +367,145 @@ def cache_clear():
         os.makedirs(CACHE_DIR, exist_ok=True)
 
 
+# ── Chapter Routes (auto-learning) ────────────────────────
+
+def _load_chapter_routes() -> dict:
+    if os.path.exists(CHAPTER_ROUTES_FILE):
+        try:
+            with open(CHAPTER_ROUTES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"keywords": {}, "chapter_boundaries": {}}
+
+
+def _save_chapter_routes(r: dict):
+    os.makedirs(os.path.dirname(CHAPTER_ROUTES_FILE), exist_ok=True)
+    with open(CHAPTER_ROUTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(r, f, ensure_ascii=False, indent=2)
+
+
+def _route_question(question: str) -> tuple[str | None, str | None]:
+    """Match question keywords to chapter/page range. Returns (chapter_hint, pages)."""
+    routes = _load_chapter_routes()
+    keywords = routes.get("keywords", {})
+    boundaries = routes.get("chapter_boundaries", {})
+
+    q_lower = question.lower()
+
+    # Exact match first (longer keyword = higher priority)
+    sorted_kws = sorted(keywords.items(), key=lambda x: -len(x[0]))
+    for kw, info in sorted_kws:
+        if kw.lower() in q_lower:
+            ch = info.get("chapter")
+            pages = info.get("pages", "")
+            if ch and str(ch) in boundaries:
+                b = boundaries[str(ch)]
+                pages = f"{b['start']}-{b['end']}"
+            # Increment hit counter
+            info["hits"] = info.get("hits", 0) + 1
+            info["last_hit"] = time.strftime("%Y-%m-%d")
+            _save_chapter_routes(routes)
+            return f"第{ch}章", pages
+
+    # Fallback: check if any chapter number mentioned in question
+    ch_match = re.search(r'第\s*(\d+)\s*章', question)
+    if ch_match:
+        ch_num = ch_match.group(1)
+        if ch_num in boundaries:
+            b = boundaries[ch_num]
+            return f"第{ch_num}章", f"{b['start']}-{b['end']}"
+
+    return None, None
+
+
+def _learn_from_result(question: str, answer: str):
+    """Extract page numbers from answer and auto-register keywords."""
+    if not answer or "ERROR" in answer:
+        return
+
+    routes = _load_chapter_routes()
+    keywords = routes.get("keywords", {})
+    boundaries = routes.get("chapter_boundaries", {})
+
+    # Extract page numbers: "第 432 页" or "第432页"
+    pages_found = re.findall(r'第\s*(\d{2,4})\s*页', answer)
+    if not pages_found:
+        return
+
+    # Determine which chapter
+    for page_str in pages_found:
+        page = int(page_str)
+        matched_ch = None
+        for ch_num, b in boundaries.items():
+            if b["start"] <= page <= b["end"]:
+                matched_ch = int(ch_num)
+                break
+
+        if matched_ch is None:
+            continue
+
+        # Extract potential keywords from the question
+        # Chinese terms (2-4 chars) and English abbreviations
+        terms = set()
+        for m in re.finditer(r'\b([A-Z]{2,6})\b', question):
+            terms.add(m.group(1))
+        # Chinese nouns: after removing question words
+        clean = re.sub(r'是什么|怎么|什么|如何|为什么|的第|在第|书中|原文|定义|请|查询|查找|关于', '', question)
+        for m in re.finditer(r'([一-鿿]{2,4})', clean):
+            terms.add(m.group(1))
+
+        for term in terms:
+            if term and term not in keywords:
+                keywords[term] = {
+                    "chapter": matched_ch,
+                    "pages": f"{boundaries[str(matched_ch)]['start']}-{boundaries[str(matched_ch)]['end']}",
+                    "source": "learned",
+                    "hits": 1,
+                    "last_hit": time.strftime("%Y-%m-%d"),
+                }
+            elif term in keywords:
+                keywords[term]["hits"] = keywords[term].get("hits", 0) + 1
+                keywords[term]["last_hit"] = time.strftime("%Y-%m-%d")
+
+    _save_chapter_routes(routes)
+
+
 # ── Query Optimization ─────────────────────────────────────
 
+FAIL_SIGNALS = [
+    "仅涵盖至", "前 166 页", "不在源文件中",
+    "仅涵盖至书中的第", "当前提供的源文件", "仅涵盖了前",
+    "当前提供的 PDF 源代码片段",
+]
+
+
+def _is_fail_signal(answer: str) -> bool:
+    lower = answer.lower()
+    return any(s in answer for s in FAIL_SIGNALS)
+
+
 def optimize_question(raw: str) -> str:
-    """Improve a question for better NotebookLM retrieval."""
+    """Improve a question for better NotebookLM retrieval with chapter routing."""
     q = raw.strip()
 
+    # Step 1: Try chapter routing
+    chapter_hint, pages = _route_question(q)
+    if chapter_hint and pages:
+        return (
+            f"在《加密与解密（第4版）》{chapter_hint}（第{pages}页）中，"
+            f"{q}。请提供具体的原文引用和页码。"
+        )
+
+    # Step 2: Generic book context
     has_book_context = any(
         kw in q for kw in ["加密与解密", "第4版", "书中", "本书", "源文件"]
     )
-    is_chapter_overview = any(
-        kw in q for kw in ["讲了什么", "主要内容", "包含哪些", "讲了啥"]
-    )
-    is_vague = len(q) < 15 and not has_book_context
 
-    if is_vague:
+    if len(q) < 15 and not has_book_context:
         return (
             f'关于《加密与解密（第4版）》中的"{q}"，请详细解释其定义、工作机制，'
-            f"并提供书中的页码引用。"
-        )
-    if is_chapter_overview and not has_book_context:
-        return (
-            f"在《加密与解密（第4版）》的{q}？"
-            f"请按节级别列出核心知识点和关键工具，标注页码范围。"
+            f"并提供具体的页码引用。"
         )
     if not has_book_context:
         return (
@@ -526,7 +643,7 @@ def ask(question: str, notebook: str = None) -> tuple[str, bool]:
 
 
 def query(question: str, notebook: str = None) -> str:
-    """Full pipeline: patch → refresh → optimize → cache → auth → ask → retry."""
+    """Full pipeline v2: patch → refresh → route → optimize → cache → auth → ask → retry → learn."""
     nb = notebook or DEFAULT_NOTEBOOK
 
     ensure_source_patched()
@@ -544,6 +661,8 @@ def query(question: str, notebook: str = None) -> str:
         state["cache_hits"] += 1
         _save_state(state)
         print("[nlm] Cache HIT — answering from cache", file=sys.stderr)
+        # Still learn from cached result
+        _learn_from_result(question, cached)
         return cached
 
     state["cache_misses"] += 1
@@ -553,13 +672,42 @@ def query(question: str, notebook: str = None) -> str:
         return "ERROR: Could not authenticate with NotebookLM. Try: py -3.11 nlm_query.py --relogin"
 
     answer, ok = ask(optimized, nb)
+
+    # Auto-retry if NotebookLM says "仅涵盖至前166页" etc.
+    retry_count = 0
+    while not ok or (_is_fail_signal(answer) and retry_count < 3):
+        retry_count += 1
+        if retry_count == 1:
+            # Try with narrower scope — add chapter hint from routes
+            ch, pages = _route_question(question)
+            if ch:
+                print(f"[nlm] Retry {retry_count}: narrowing to {ch} pp{pages}", file=sys.stderr)
+                optimized = f"在《加密与解密（第4版）》{ch}（第{pages}页）中，{question}。请提供具体页码引用。"
+            else:
+                print(f"[nlm] Retry {retry_count}: generic retry", file=sys.stderr)
+        elif retry_count == 2:
+            # Probe: ask where this term appears
+            print(f"[nlm] Retry {retry_count}: probe query", file=sys.stderr)
+            optimized = f"在《加密与解密（第4版）》中，术语\"{question[:50]}\"出现在哪一章？请给出章节号和页码。"
+        else:
+            # Expand to full book search
+            print(f"[nlm] Retry {retry_count}: full book search", file=sys.stderr)
+            optimized = f"请从《加密与解密（第4版）》全书中查找：{question}。请提供原文引用和具体页码。"
+
+        # Avoid caching retry attempts
+        answer, ok = ask(optimized, nb)
+        if ok and not _is_fail_signal(answer):
+            break
+
     if ok:
         cache_set(optimized, nb, answer)
         _record_query(state)
         _save_state(state)
+        # Auto-learn: extract page numbers and register new keywords
+        _learn_from_result(question, answer)
         return answer
 
-    # Retry once
+    # Final retry after re-login
     print("[nlm] Retrying after re-login...", file=sys.stderr)
     time.sleep(2)
     if relogin():
@@ -569,6 +717,7 @@ def query(question: str, notebook: str = None) -> str:
             cache_set(optimized, nb, answer)
             _record_query(state)
             _save_state(state)
+            _learn_from_result(question, answer)
             return answer
 
     if "status code 5" in answer:
@@ -598,6 +747,7 @@ def query_raw(question: str, notebook: str = None, *, use_cache: bool = True, op
     answer, ok = ask(final_q, nb)
     if use_cache and ok:
         cache_set(final_q, nb, answer)
+        _learn_from_result(question, answer)
 
     state = _load_state()
     _record_query(state)
