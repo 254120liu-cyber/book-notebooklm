@@ -547,10 +547,25 @@ def relogin() -> bool:
 
     init_mtime = os.path.getmtime(STORAGE_STATE) if os.path.exists(STORAGE_STATE) else 0
 
+    env = _env()
+    # Pass Windows system proxy to Playwright browser
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        proxy_enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+        if proxy_enable:
+            proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            env["HTTP_PROXY"] = f"http://{proxy_server}"
+            env["HTTPS_PROXY"] = f"http://{proxy_server}"
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
     p = subprocess.Popen(
         [_NLM_EXE, "login", "--browser", "msedge"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        env=_env(),
+        env=env,
     )
 
     deadline = time.time() + 60
