@@ -65,23 +65,40 @@ def _resolve_default_notebook() -> str:
     2. NOTEBOOKLM_DEFAULT_NB environment variable (with staleness warning)
     3. Hardcoded fallback
     """
-    # book_map is the source of truth (managed by add_book pipeline)
-    book_map = _load_book_map()
-    if book_map:
-        first = next(iter(book_map.values()))
-        map_nb = first.get("notebook_id")
-        if map_nb:
-            # Warn if env var points to a stale notebook
-            env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
-            if env_val and env_val != map_nb:
-                print(f"[nlm] ⚠ NOTEBOOKLM_DEFAULT_NB={env_val} is stale, "
-                      f"using book_map: {map_nb}", file=sys.stderr)
-            return map_nb
-
-    # Fallback: env var (may be set manually by user)
+    # Priority: env var > active_book > book_map first entry > fallback
     env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
     if env_val:
         return env_val
+
+    # Check active book
+    active_file = os.path.join(STATE_DIR, "active_book.json")
+    if os.path.exists(active_file):
+        try:
+            with open(active_file, "r", encoding="utf-8") as f:
+                active = json.load(f)
+            name = active.get("name")
+            if name:
+                book_map = _load_book_map()
+                for k, v in book_map.items():
+                    if name in k or k in name:
+                        nb_id = v.get("notebook_id")
+                        if nb_id:
+                            return nb_id
+                # Exact match fallback
+                info = book_map.get(name, {})
+                nb_id = info.get("notebook_id")
+                if nb_id:
+                    return nb_id
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # First entry in book_map
+    book_map = _load_book_map()
+    if book_map:
+        first = next(iter(book_map.values()))
+        nb_id = first.get("notebook_id")
+        if nb_id:
+            return nb_id
 
     return "51429604"
 

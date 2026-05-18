@@ -156,20 +156,10 @@ def _extract_toc_from_outline(pdf_path: str, total_pages: int) -> list[dict]:
             page_num = _resolve_page_number(reader, page_obj)
             if page_num is None or page_num < 1:
                 continue
-            # Check if this entry has its own sub-children (sections)
             has_kids = bool(item.get("/Count"))
-            # Collect chapter-like entries:
-            # - depth 0: skip (usually book title / part names)
-            # - depth 1: these are usually chapter or major section names
-            # - depth 2+: sub-sections, only take if they look like independent chapters
-            if depth == 1 and has_kids:
-                chapter_num += 1
-                chapters.append({
-                    "chapter": chapter_num,
-                    "title": title[:80],
-                    "start_page": page_num,
-                })
-            elif depth >= 2 and has_kids and not _is_subsection_number(title):
+            # Capture entries that have children (sub-sections) at any depth
+            # These are chapter/section-like entries with content
+            if has_kids:
                 chapter_num += 1
                 chapters.append({
                     "chapter": chapter_num,
@@ -203,8 +193,8 @@ def _resolve_page_number(reader, page_obj) -> int | None:
 def _is_metadata(title: str) -> bool:
     """Filter out metadata entries from bookmarks (covers, copyright, etc.)."""
     meta_patterns = [
-        "封面", "扉页", "版权", "前言", "序言", "目录", "致谢",
-        ".pdf", "RJTS", "FLb",
+        "封面", "扉页", "版权", "前言", "序言", "目录", "致谢", "样章",
+        ".pdf", "RJTS", "FLb", "文前", "正文",
         "preface", "cover", "toc", "acknowledgment",
     ]
     tl = title.lower()
@@ -1030,8 +1020,8 @@ def main():
 
     print(f"  Total pages: {total_pages}")
 
-    if total_pages <= MAX_PAGES_PER_CHUNK:
-        print(f"  ≤{MAX_PAGES_PER_CHUNK} pages — direct upload, no splitting needed.")
+    if total_pages <= MAX_PAGES_PER_CHUNK + 10:  # Allow 10-page grace margin
+        print(f"  ≤{MAX_PAGES_PER_CHUNK + 10} pages — direct upload, no splitting needed.")
         split_pdfs = [upload_path]
     else:
         print(f"  >{MAX_PAGES_PER_CHUNK} pages — extracting TOC and splitting by chapters...")
