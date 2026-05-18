@@ -61,38 +61,27 @@ def _load_book_map() -> dict:
 
 def _resolve_default_notebook() -> str:
     """Determine which notebook to use, in priority order:
-    1. NOTEBOOKLM_DEFAULT_NB environment variable (explicit override)
-    2. Active book from ~/.notebooklm/profiles/default/active_book.json
-    3. First entry in ~/.notebooklm/book_map.json
-    4. Hardcoded fallback
+    1. book_map.json (authoritative — updated by nlm_add_book.py)
+    2. NOTEBOOKLM_DEFAULT_NB environment variable (with staleness warning)
+    3. Hardcoded fallback
     """
-    env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
-    if env_val:
-        return env_val
-
-    # Check active_book.json
-    active_file = os.path.join(STATE_DIR, "active_book.json")
-    if os.path.exists(active_file):
-        try:
-            with open(active_file, "r", encoding="utf-8") as f:
-                active = json.load(f)
-            name = active.get("name")
-            if name:
-                book_map = _load_book_map()
-                info = book_map.get(name, {})
-                nb_id = info.get("notebook_id")
-                if nb_id:
-                    return nb_id
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # First entry in book map
+    # book_map is the source of truth (managed by add_book pipeline)
     book_map = _load_book_map()
     if book_map:
         first = next(iter(book_map.values()))
-        nb_id = first.get("notebook_id")
-        if nb_id:
-            return nb_id
+        map_nb = first.get("notebook_id")
+        if map_nb:
+            # Warn if env var points to a stale notebook
+            env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
+            if env_val and env_val != map_nb:
+                print(f"[nlm] ⚠ NOTEBOOKLM_DEFAULT_NB={env_val} is stale, "
+                      f"using book_map: {map_nb}", file=sys.stderr)
+            return map_nb
+
+    # Fallback: env var (may be set manually by user)
+    env_val = os.environ.get("NOTEBOOKLM_DEFAULT_NB")
+    if env_val:
+        return env_val
 
     return "51429604"
 
@@ -497,7 +486,10 @@ def optimize_question(raw: str) -> str:
             f"{q}。请提供具体的原文引用和页码。"
         )
 
-    # Step 2: Generic book context
+    # Step 2: Routing miss — tell user, proceed with full-book search
+    if len(q) > 3:
+        print(f"[nlm] 术语未收录，全文搜索（命中后将自动收录）", file=sys.stderr)
+
     has_book_context = any(
         kw in q for kw in ["加密与解密", "第4版", "书中", "本书", "源文件"]
     )

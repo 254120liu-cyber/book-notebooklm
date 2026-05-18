@@ -576,9 +576,14 @@ def _check_and_report(path: str, max_mb: int, engine_name: str) -> bool:
 # ── NotebookLM Operations ──────────────────────────────────
 
 async def create_and_upload_all(
-    split_pdfs: list[str], book_name: str, wait_for_ocr: bool = True
+    split_pdfs: list[str], book_name: str, wait_for_ocr: bool = True,
+    ocr_timeout: int = 300,
 ) -> tuple[str, str, list]:
-    """Create notebook + upload all split PDFs. Returns (nb_id, title, sources)."""
+    """Create notebook + upload all split PDFs. Returns (nb_id, title, sources).
+
+    All sources must pass OCR before returning. Sources that timeout get
+    one retry; if still failing, report to user but don't block the notebook.
+    """
     from notebooklm import NotebookLMClient
 
     print(f"\n[1/3] Creating notebook \"{book_name}\"...")
@@ -587,36 +592,62 @@ async def create_and_upload_all(
         nb_id = notebook.id
         print(f"  Created: {nb_id}")
 
+        # ── Upload phase ──
         sources = []
         for i, pdf_path in enumerate(split_pdfs):
             fname = os.path.basename(pdf_path)
-            print(f"[2/3] Uploading [{i+1}/{len(split_pdfs)}] {fname}...")
+            size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
+            print(f"[2/3] Uploading [{i+1}/{len(split_pdfs)}] {fname} ({size_mb:.0f}MB)...")
             try:
                 source = await client.sources.add_file(nb_id, pdf_path, wait=False)
                 sources.append(source)
-                print(f"  Uploaded: {source.id}")
+                print(f"  ✓ Uploaded: {source.id}")
             except Exception as e:
-                print(f"  [ERR] Upload failed for {fname}: {e}")
-                # Try OCR-adaptive: if upload fails, skip this chunk (rare)
+                print(f"  ✗ Upload failed: {e}")
                 continue
 
-        if wait_for_ocr:
-            print(f"[3/3] Waiting for OCR indexing ({len(sources)} sources)...")
-            for i, source in enumerate(sources):
-                print(f"  [{i+1}/{len(sources)}] {source.title}...")
+        if not wait_for_ocr:
+            return nb_id.split("-")[0], notebook.title, sources
+
+        # ── OCR phase: wait for ALL sources, with retry ──
+        print(f"\n[3/3] OCR indexing {len(sources)} sources (timeout={ocr_timeout}s each)...")
+        ocr_ok = 0
+        ocr_pending = 0
+        ocr_failed = []
+
+        for i, source in enumerate(sources):
+            fname = source.title or f"source {i+1}"
+            print(f"  [{i+1}/{len(sources)}] {fname[:50]}...")
+
+            ok = False
+            for attempt in range(2):  # 2 attempts
                 try:
                     source = await client.sources.wait_until_ready(
-                        nb_id, source.id, timeout=300
+                        nb_id, source.id, timeout=ocr_timeout
                     )
-                    print(f"    ✓ Ready")
+                    ok = True
+                    break
                 except Exception as e:
-                    msg = str(e)
-                    if "timeout" in msg.lower() or "timed out" in msg.lower():
-                        print(f"    [OCR TIMEOUT] Source is {source.title}")
-                        # Don't delete — just warn. OCR continues in background.
-                        print(f"    Notebook is still usable; indexing may continue in background.")
+                    if attempt == 0:
+                        print(f"    Retry {attempt+1}: {e}")
+                        await asyncio.sleep(3)
                     else:
-                        print(f"    [WARN] {e}")
+                        print(f"    OCR failed after 2 attempts: {e}")
+
+            if ok:
+                print(f"    ✓ OCR ready")
+                ocr_ok += 1
+            else:
+                ocr_failed.append(fname)
+                print(f"    ⚠ OCR pending (indexing continues in background)")
+
+        if ocr_failed:
+            print(f"\n  ⚠ {len(ocr_failed)}/{len(sources)} sources still indexing:")
+            for f in ocr_failed:
+                print(f"      - {f}")
+            print(f"  The notebook is usable; these may become available later.")
+
+        print(f"\n  OCR: {ocr_ok} ready, {len(ocr_failed)} pending, {len(sources)} total")
 
     return nb_id.split("-")[0], notebook.title, sources
 
