@@ -652,16 +652,33 @@ async def delete_notebook_completely(nb_id: str) -> bool:
 # ── Cleanup ────────────────────────────────────────────────
 
 def cleanup_old_notebooks(book_name: str, new_nb_id: str):
-    """Delete old notebooks from both NotebookLM API and local book_map.
+    """Delete old notebooks ONLY for the SAME book from both NotebookLM API and local book_map.
 
     Must be called after new notebook is fully verified (OCR ready).
-    Only deletes when the new notebook has sources confirmed.
+    Never touches notebooks belonging to other books.
     """
     books = load_book_map()
     to_delete = []
+
+    # Normalize names for fuzzy comparison
+    def _same_book(a: str, b: str) -> bool:
+        """Check if two book names refer to the same book."""
+        a_norm = a.replace(" ", "").replace("-", "").replace("_", "").lower()
+        b_norm = b.replace(" ", "").replace("-", "").replace("_", "").lower()
+        # One contains the other
+        if a_norm in b_norm or b_norm in a_norm:
+            return True
+        # Share significant keyword overlap
+        a_key = a_norm[:4]
+        b_key = b_norm[:4]
+        return a_key == b_key and len(a_key) >= 2
+
     for k, v in list(books.items()):
-        if v.get("notebook_id") != new_nb_id:
-            to_delete.append((k, v.get("notebook_id")))
+        if not _same_book(k, book_name):
+            continue  # ← Skip other books entirely
+        if v.get("notebook_id") == new_nb_id:
+            continue  # ← Skip the new notebook itself
+        to_delete.append((k, v.get("notebook_id")))
 
     deleted_ids = set()
     for k, old_id in to_delete:
