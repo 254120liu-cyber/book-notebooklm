@@ -227,16 +227,23 @@ def _extract_toc_from_text(pdf_path: str, total_pages: int) -> list[dict]:
             continue
 
         # Match: "第X章" patterns
+        # The first 35 pages may contain TOC. The page_hint from TOC
+        # entries is the actual chapter page — validate it against total_pages.
         for m in re.finditer(r'第\s*(\d{1,2})\s*章\s*(.+?)(?:\s*\.{3,}|\s*\d{2,4}\s*$|\s*$)', text):
             ch_num = int(m.group(1))
             ch_title = m.group(2).strip().rstrip('.')[:80]
-            if ch_num not in seen and 1 <= ch_num <= 30:
+            if ch_num not in seen and 1 <= ch_num <= 50:
                 seen.add(ch_num)
                 page_hint = _extract_page_after_match(text, m.end())
+                # Validate: page_hint from TOC is usually the real chapter page
+                if page_hint and 1 <= page_hint <= total_pages:
+                    start = page_hint
+                else:
+                    start = page_num + 1
                 chapters.append({
                     "chapter": ch_num,
                     "title": f"第{ch_num}章 {ch_title}",
-                    "start_page": page_hint or page_num + 1,
+                    "start_page": start,
                 })
         # English "Chapter N" patterns
         for m in re.finditer(r'Chapter\s+(\d{1,2})\s*[:\-]?\s*(.+?)(?:\s*\.{3,}|\s*\d{2,4}\s*$|\s*$)', text, re.IGNORECASE):
