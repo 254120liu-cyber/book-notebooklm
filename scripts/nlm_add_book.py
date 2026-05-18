@@ -621,15 +621,29 @@ async def create_and_upload_all(
     return nb_id.split("-")[0], notebook.title, sources
 
 
-async def delete_notebook_sources(nb_id: str) -> bool:
-    """Delete all sources from a notebook."""
+async def delete_notebook_completely(nb_id: str) -> bool:
+    """Delete a notebook and all its sources from NotebookLM."""
     try:
         from notebooklm import NotebookLMClient
         async with await NotebookLMClient.from_storage() as client:
-            full_id = nb_id
+            # Find full notebook ID
+            notebooks = await client.notebooks.list()
+            full_id = None
+            for n in notebooks:
+                if n.id.startswith(nb_id):
+                    full_id = n.id
+                    break
+            if not full_id:
+                return False
+            # Delete all sources first
             sources = await client.sources.list(full_id)
             for s in sources:
-                await client.sources.delete(full_id, s.id)
+                try:
+                    await client.sources.delete(full_id, s.id)
+                except Exception:
+                    pass
+            # Then delete the notebook itself
+            await client.notebooks.delete(full_id)
             return True
     except Exception:
         return False
@@ -638,24 +652,33 @@ async def delete_notebook_sources(nb_id: str) -> bool:
 # ── Cleanup ────────────────────────────────────────────────
 
 def cleanup_old_notebooks(book_name: str, new_nb_id: str):
-    """Remove old notebook entries for the same book from book_map after
-    verifying the new one is set up."""
+    """Delete old notebooks from both NotebookLM API and local book_map.
+
+    Must be called after new notebook is fully verified (OCR ready).
+    Only deletes when the new notebook has sources confirmed.
+    """
     books = load_book_map()
     to_delete = []
-    for k, v in books.items():
-        # Same book prefix or similar name
-        if k.startswith(book_name) or book_name.startswith(k):
-            if v.get("notebook_id") != new_nb_id:
-                to_delete.append((k, v.get("notebook_id")))
+    for k, v in list(books.items()):
+        if v.get("notebook_id") != new_nb_id:
+            to_delete.append((k, v.get("notebook_id")))
 
+    deleted_ids = set()
     for k, old_id in to_delete:
-        print(f"  Cleaning up old notebook: {k} ({old_id})")
+        if old_id in deleted_ids:
+            del books[k]
+            continue
+        print(f"  Deleting old notebook: {k} ({old_id})")
+        if asyncio.run(delete_notebook_completely(old_id)):
+            print(f"    ✓ Deleted from NotebookLM")
+            deleted_ids.add(old_id)
+        else:
+            print(f"    ⚠ Could not delete from API (may already be gone)")
         del books[k]
 
     save_book_map(books)
-
-    if to_delete and len(to_delete) > 0:
-        print(f"  Removed {len(to_delete)} old notebook entries.")
+    if deleted_ids:
+        print(f"  Cleaned up {len(deleted_ids)} old notebook(s).")
 
 
 # ── CLI ────────────────────────────────────────────────────
