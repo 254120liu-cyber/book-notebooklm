@@ -82,32 +82,142 @@ def save_routes(r: dict):
 # ── PDF TOC Extraction ─────────────────────────────────────
 
 def extract_toc(pdf_path: str) -> list[dict]:
-    """Extract chapter boundaries from PDF table of contents.
+    """Extract chapter boundaries from PDF. Three-tier strategy:
 
-    Scans the first 30 pages for chapter/section headers like:
-      '第7章 Windows内核基础'
-      '7.1 内核理论基础'
-      '第11章 PE文件格式'
+    Tier 1: PDF outline/bookmarks (most reliable, works even for scanned PDFs)
+    Tier 2: Text-based regex scan (for PDFs with text layer)
+    Tier 3: Chapter presets (for known books)
+    Tier 4: Even-page fallback (last resort)
 
-    Returns: [{chapter: int, title: str, start_page: int}, ...]
+    Returns: [{chapter: int, title: str, start_page: int, end_page: int}, ...]
     """
+    total_pages = 100
     try:
         import PyPDF2
-    except ImportError:
-        print("  [WARN] PyPDF2 not installed. Falling back to even-page split.")
-        return _fallback_chapter_split(pdf_path)
-
-    try:
         reader = PyPDF2.PdfReader(pdf_path)
         total_pages = len(reader.pages)
+    except Exception:
+        pass
+
+    # ── Tier 1: PDF bookmarks ──
+    try:
+        chapters = _extract_toc_from_outline(pdf_path, total_pages)
+        if chapters and len(chapters) >= 3:
+            print(f"  TOC via PDF bookmarks: {len(chapters)} chapters")
+            return chapters
     except Exception as e:
-        print(f"  [WARN] Cannot read PDF: {e}. Falling back to even-page split.")
-        return _fallback_chapter_split(pdf_path)
+        pass
+
+    # ── Tier 2: Text regex scan ──
+    try:
+        chapters = _extract_toc_from_text(pdf_path, total_pages)
+        if chapters and len(chapters) >= 3:
+            print(f"  TOC via text extraction: {len(chapters)} chapters")
+            return chapters
+    except Exception as e:
+        pass
+
+    # ── Tier 3: Known book preset ──
+    book_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    for preset_key, preset_chapters in CHAPTER_PRESETS.items():
+        if preset_key in book_name or any(c in book_name for c in ["加密", "解密", "调试", "逆向"]):
+            chapters = _build_preset_chapters(preset_chapters, total_pages)
+            if chapters:
+                print(f"  TOC via preset ({preset_key}): {len(chapters)} chapters")
+                return chapters
+
+    # ── Tier 4: Even-page fallback ──
+    print(f"  TOC: all tiers failed, even-page fallback")
+    return _fallback_even_split(total_pages)
+
+
+def _extract_toc_from_outline(pdf_path: str, total_pages: int) -> list[dict]:
+    """Extract TOC from PDF bookmarks/outline (Tier 1)."""
+    from PyPDF2 import PdfReader
+
+    reader = PdfReader(pdf_path)
+    outline = reader.outline
+    if not outline:
+        return []
 
     chapters = []
-    seen_chapters = set()
+    chapter_num = 0
 
-    # Scan pages 1-35 for TOC and chapter headers
+    def _flatten(items, depth=0):
+        nonlocal chapter_num
+        for item in items:
+            if isinstance(item, list):
+                _flatten(item, depth + 1)
+                continue
+            title = str(item.get("/Title", ""))
+            if not title or len(title) < 2 or _is_metadata(title):
+                continue
+            page_obj = item.get("/Page")
+            page_num = _resolve_page_number(reader, page_obj)
+            if page_num is None or page_num < 1:
+                continue
+            # Check if this entry has its own sub-children (sections)
+            has_kids = bool(item.get("/Count"))
+            # Collect chapter-like entries:
+            # - depth 0: skip (usually book title / part names)
+            # - depth 1: these are usually chapter or major section names
+            # - depth 2+: sub-sections, only take if they look like independent chapters
+            if depth == 1 and has_kids:
+                chapter_num += 1
+                chapters.append({
+                    "chapter": chapter_num,
+                    "title": title[:80],
+                    "start_page": page_num,
+                })
+            elif depth >= 2 and has_kids and not _is_subsection_number(title):
+                chapter_num += 1
+                chapters.append({
+                    "chapter": chapter_num,
+                    "title": title[:80],
+                    "start_page": page_num,
+                })
+
+    _flatten(outline)
+    return _finalize_chapters(chapters, total_pages)
+
+
+def _resolve_page_number(reader, page_obj) -> int | None:
+    """Resolve a PDF page object to a 1-based page number."""
+    if page_obj is None:
+        return None
+    try:
+        # PyPDF2 way: get PageObject and find its index
+        from PyPDF2 import PageObject, IndirectObject
+        if isinstance(page_obj, IndirectObject):
+            page_num = reader.get_page_number(page_obj)
+            return page_num + 1  # 0-based → 1-based
+        elif hasattr(page_obj, "get_object"):
+            obj = page_obj.get_object()
+            page_num = reader.get_page_number(obj)
+            return page_num + 1
+    except Exception:
+        pass
+    return None
+
+
+def _is_metadata(title: str) -> bool:
+    """Filter out metadata entries from bookmarks (covers, copyright, etc.)."""
+    meta_patterns = [
+        "封面", "扉页", "版权", "前言", "序言", "目录", "致谢",
+        ".pdf", "RJTS", "FLb",
+        "preface", "cover", "toc", "acknowledgment",
+    ]
+    tl = title.lower()
+    return any(p.lower() in tl for p in meta_patterns)
+
+
+def _extract_toc_from_text(pdf_path: str, total_pages: int) -> list[dict]:
+    """Extract TOC by scanning text of first pages (Tier 2)."""
+    from PyPDF2 import PdfReader
+    reader = PdfReader(pdf_path)
+    chapters = []
+    seen = set()
+
     for page_num in range(min(35, total_pages)):
         try:
             text = reader.pages[page_num].extract_text()
@@ -116,35 +226,89 @@ def extract_toc(pdf_path: str) -> list[dict]:
         except Exception:
             continue
 
-        # Match Chinese chapter patterns: "第X章" or "第XX章"
-        for match in re.finditer(r'第(\d{1,2})章\s*(.+?)(?:\s*\.{3,}|\s*\d{1,3}\s*$|\s*$)', text):
-            ch_num = int(match.group(1))
-            ch_title = match.group(2).strip().rstrip('.')[:80]
-            if ch_num not in seen_chapters and ch_num <= 30:
-                seen_chapters.add(ch_num)
-                # Try to find page number after the chapter title
-                page_hint = _extract_page_after_match(text, match.end())
+        # Match: "第X章" patterns
+        for m in re.finditer(r'第\s*(\d{1,2})\s*章\s*(.+?)(?:\s*\.{3,}|\s*\d{2,4}\s*$|\s*$)', text):
+            ch_num = int(m.group(1))
+            ch_title = m.group(2).strip().rstrip('.')[:80]
+            if ch_num not in seen and 1 <= ch_num <= 30:
+                seen.add(ch_num)
+                page_hint = _extract_page_after_match(text, m.end())
                 chapters.append({
                     "chapter": ch_num,
                     "title": f"第{ch_num}章 {ch_title}",
-                    "page_hint": page_hint,
+                    "start_page": page_hint or page_num + 1,
+                })
+        # English "Chapter N" patterns
+        for m in re.finditer(r'Chapter\s+(\d{1,2})\s*[:\-]?\s*(.+?)(?:\s*\.{3,}|\s*\d{2,4}\s*$|\s*$)', text, re.IGNORECASE):
+            ch_num = int(m.group(1))
+            ch_title = m.group(2).strip()[:80]
+            if ch_num not in seen and 1 <= ch_num <= 30:
+                seen.add(ch_num)
+                chapters.append({
+                    "chapter": ch_num,
+                    "title": f"Chapter {ch_num}: {ch_title}",
+                    "start_page": page_num + 1,
                 })
 
     if len(chapters) < 3:
-        print("  [WARN] TOC scan found <3 chapters. Falling back to even-page split.")
-        return _fallback_chapter_split(pdf_path)
-
-    # Sort by chapter number
+        return []
     chapters.sort(key=lambda c: c["chapter"])
+    return _finalize_chapters(chapters, total_pages)
 
-    # Try to get actual page numbers from PDF structure if available
-    chapters = _refine_page_numbers(chapters, reader, total_pages)
 
-    print(f"  TOC extracted: {len(chapters)} chapters")
-    for c in chapters:
-        print(f"    第{c['chapter']}章 (起始 ~p{c['start_page']})")
-
+def _build_preset_chapters(preset: dict, total_pages: int) -> list[dict]:
+    """Build chapter list from known preset (Tier 3)."""
+    chapters = []
+    for ch_num in sorted(preset.keys()):
+        entry = preset[ch_num]
+        start, end, title = entry[0], entry[1], entry[2]
+        keywords_str = entry[3] if len(entry) > 3 else ""
+        chapters.append({
+            "chapter": ch_num,
+            "title": f"第{ch_num}章 {title}",
+            "start_page": start,
+            "end_page": min(end, total_pages),
+            "keywords": keywords_str,
+        })
     return chapters
+
+
+def _fallback_even_split(total_pages: int) -> list[dict]:
+    """Even-page split when all extraction methods fail (Tier 4)."""
+    chapters = []
+    for start in range(1, total_pages + 1, MAX_PAGES_PER_CHUNK):
+        end = min(start + MAX_PAGES_PER_CHUNK - 1, total_pages)
+        chapters.append({
+            "chapter": len(chapters) + 1,
+            "title": f"Part {len(chapters) + 1} (pp {start}-{end})",
+            "start_page": start,
+            "end_page": end,
+        })
+    return chapters
+
+
+def _finalize_chapters(chapters: list, total_pages: int) -> list:
+    """Sort chapters and fill in end_page boundaries."""
+    if not chapters:
+        return []
+    chapters.sort(key=lambda c: c["chapter"])
+    for i in range(len(chapters)):
+        if "end_page" not in chapters[i]:
+            if i + 1 < len(chapters):
+                chapters[i]["end_page"] = max(chapters[i + 1]["start_page"] - 1, chapters[i]["start_page"])
+            else:
+                chapters[i]["end_page"] = total_pages
+        # Clean up temporary fields
+        for field in ["page_hint", "keywords_str"]:
+            chapters[i].pop(field, None)
+    # Remove duplicate chapter numbers (keep first)
+    seen = set()
+    deduped = []
+    for c in chapters:
+        if c["chapter"] not in seen:
+            seen.add(c["chapter"])
+            deduped.append(c)
+    return deduped
 
 
 def _extract_page_after_match(text: str, pos: int) -> int | None:
@@ -402,19 +566,55 @@ def _make_chunk(name_parts: list, start: int, end: int) -> dict:
 
 def _extract_terms(title: str) -> list[str]:
     """Extract searchable terms from a chapter/section title."""
-    # Remove chapter numbers and common words
-    clean = re.sub(r'第\d+章|第[一二三四五六七八九十]+章|\d+\.\d+(\.\d+)?|\s+', ' ', title)
-    # Split Chinese + English terms
     terms = []
-    # English abbreviations (uppercase 2-6 chars)
-    for m in re.finditer(r'\b([A-Z]{2,6})\b', clean):
-        terms.append(m.group(1))
-    # Chinese key terms (2-4 chars after removing common suffixes)
-    cn_parts = re.split(r'[、，,。.\s]+', clean)
+
+    # Extract abbreviations from parentheses BEFORE stripping
+    for m in re.finditer(r'[（(]\s*([A-Za-z0-9]+(?:\s+[A-Za-z0-9]+)*)\s*[)）]', title):
+        abbr = m.group(1).replace(' ', '').upper()
+        if 2 <= len(abbr) <= 10:
+            terms.append(abbr)
+
+    # Extract space-separated uppercase letters as abbreviation
+    space_abbr = re.findall(r'\b([A-Z](?:\s+[A-Z]){1,6})\b', title)
+    for sa in space_abbr:
+        abbr = sa.replace(' ', '')
+        if abbr not in terms:
+            terms.append(abbr)
+
+    # Remove chapter numbers and parentheses content
+    clean = re.sub(r'第\d+章|第[一二三四五六七八九十]+章|\d+\.\d+(\.\d+)?|\s+', ' ', title)
+    clean = re.sub(r'[（(][^)）]*[)）]', ' ', clean)
+
+    # English terms
+    for m in re.finditer(r'\b([A-Z]{2,7}|[A-Z][a-z]+[A-Z][a-zA-Z]*)\b', clean):
+        t = m.group(1)
+        if t not in ('Windows',):  # too generic alone
+            terms.append(t)
+
+    # Chinese terms: split by delimiters
+    cn_parts = re.split(r'[、，,。/.\s]+', clean)
     for part in cn_parts:
         part = part.strip()
-        if 2 <= len(part) <= 8 and not part.startswith('第'):
+        if not part:
+            continue
+        if 2 <= len(part) <= 10:
             terms.append(part)
+        # Sliding window for sub-terms in long phrases
+        if len(part) > 4:
+            for i in range(0, len(part) - 1):
+                sub = part[i:i + 2]
+                if sub not in terms and not re.match(r'^[\d\s]+$', sub):
+                    terms.append(sub)
+
+    # Single Chinese char terms (e.g. "堆", "栈") as fallback
+    single_chars = set()
+    for ch in re.findall(r'([一-鿿])', clean):
+        if ch not in ('和', '与', '及', '的', '在', '是', '不', '了', '有', '人', '这', '中', '大'):
+            single_chars.add(ch)
+    for ch in single_chars:
+        if ch not in terms:
+            terms.append(ch)
+
     return terms
 
 
