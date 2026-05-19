@@ -37,6 +37,27 @@ COMPRESS_ABOVE_MB = 200
 MAX_PAGES_PER_CHUNK = 100
 
 
+def _clean_book_name(raw: str) -> str:
+    """Clean up a PDF filename into a readable book name.
+
+    Removes: Z-Library suffixes, edition info in brackets, author lists,
+    and trailing junk like '(Z-Library)' or '【无封面】'.
+    """
+    name = raw
+    # Remove parenthesized author lists and source markers
+    name = re.sub(r'\s*[（(][^)）]*?(Z-Library|佚名|著|译|编|出版社)[^)）]*?[)）]', '', name)
+    # Remove bracketed annotations like 【无封面、版权页】
+    name = re.sub(r'\s*【[^】]*】', '', name)
+    # Remove trailing parenthesized content
+    name = re.sub(r'\s*\([^)]*\)$', '', name)
+    name = re.sub(r'\s*（[^）]*）$', '', name)
+    # Remove stray " - " suffixes
+    name = re.sub(r'\s*-\s*$', '', name)
+    # Normalize whitespace
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name if len(name) >= 2 else raw
+
+
 # ── Book Map ──────────────────────────────────────────────
 
 def load_book_map() -> dict:
@@ -61,30 +82,207 @@ def set_active_book(name: str):
         json.dump({"name": name, "set_at": time.time()}, f)
 
 
+async def _query_full_toc_from_nb(client, nb_id: str, book_name: str) -> dict[str, dict]:
+    """Query NotebookLM for the complete book TOC, parse into sub-section tree.
+
+    Returns: {ch_str: {section_id: {title, start_page}, ...}, ...}
+    Only adds sub_sections that the chapter_routes don't already have.
+    """
+    prompt = (
+        f"请列出《{book_name}》的完整目录结构，包括每一章下的所有小节编号和标题。"
+        f"请严格按照\"X.Y 标题\"或\"X.Y.Z 标题\"的格式输出，每个小节一行。"
+        f"按章节顺序排列，不需要页码，只需要编号和标题。"
+    )
+    try:
+        answer = await client.ask(nb_id, prompt)
+        if not answer:
+            return {}
+    except Exception:
+        return {}
+
+    # Parse: "7.1 标题" or "7.1.1 标题" pattern
+    tree: dict[str, dict] = {}
+    current_ch = None
+    for line in answer.split("\n"):
+        line = line.strip()
+        # Skip markdown markers and non-content lines
+        line = re.sub(r'^\*+\s*|^[\-\•]\s*|^\d+[\.\)]\s*', '', line)
+        # Match section IDs: "7.1 标题", "7.1.1 标题", "7.1.1.1 标题" (任意深度)
+        m = re.match(r'(\d+)\.(\d+(?:\.\d+)*)\s+(.+)', line)
+        if m:
+            ch_num = m.group(1)
+            sec_id = f"{ch_num}.{m.group(2)}"
+            sec_title = m.group(3).strip()[:80]
+            if ch_num not in tree:
+                tree[ch_num] = {}
+            tree[ch_num][sec_id] = {"title": sec_title, "start_page": 0}
+            continue
+        # Match chapter-only: "第7章 标题"
+        m = re.match(r'第\s*(\d+)\s*章\s+(.+)', line)
+        if m:
+            current_ch = m.group(1)
+            continue
+
+    # Filter: only keep sections with at least 2 sub-sections per chapter
+    result = {}
+    for ch_str, subs in tree.items():
+        if len(subs) >= 2:
+            result[ch_str] = subs
+
+    return result
+
+
+async def _ensure_full_toc(book_name: str, nb_id: str):
+    """After OCR, query NotebookLM for full TOC to get lowest-level sections.
+
+    Only queries if chapter_routes.json doesn't already have sub_sections for this book.
+    Updates chapter_routes.json in place.
+    """
+    routes = load_routes()
+    books = routes.get("books", {})
+    book_data = books.get(book_name, {})
+    boundaries = book_data.get("chapter_boundaries", {})
+
+    # Check if any chapter already has sub_sections (from PDF bookmarks)
+    has_subs = any(b.get("sub_sections") for b in boundaries.values())
+    if has_subs:
+        return  # Already have sub-sections from PDF bookmarks
+
+    # Only query if we have >3 chapters to avoid wasting queries on tiny books
+    if len(boundaries) < 3:
+        return
+
+    print(f"  Auto-detecting sub-section structure via NotebookLM...")
+    try:
+        from notebooklm import NotebookLMClient
+        async with await NotebookLMClient.from_storage() as client:
+            toc_tree = await _query_full_toc_from_nb(client, nb_id, book_name)
+    except Exception as e:
+        print(f"  [WARN] TOC query failed: {e}")
+        return
+
+    if not toc_tree:
+        print(f"  [WARN] Could not parse TOC from NotebookLM response")
+        return
+
+    # Merge into chapter_routes
+    updated = 0
+    for ch_str, subs in toc_tree.items():
+        if ch_str in boundaries and len(subs) >= 2:
+            boundaries[ch_str]["sub_sections"] = subs
+            updated += 1
+
+    if updated:
+        books[book_name] = book_data
+        routes["books"] = books
+        os.makedirs(os.path.dirname(ROUTES_FILE), exist_ok=True)
+        with open(ROUTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(routes, f, ensure_ascii=False, indent=2)
+        total_subs = sum(len(s) for s in toc_tree.values())
+        # Compute max depth
+        max_d = 1
+        for subs in toc_tree.values():
+            for sec_id in subs:
+                d = sec_id.count(".") + 1
+                if d > max_d:
+                    max_d = d
+        book_data["max_depth"] = max_d
+        print(f"  Sub-section tree saved: {updated} chapters, {total_subs} sections (max depth={max_d})")
+    else:
+        print(f"  No sub-sections found in TOC response")
+
+
 # ── Chapter Routes ─────────────────────────────────────────
 
-def load_routes() -> dict:
+def load_routes(book_name: str = None) -> dict:
+    """Load chapter routes. If book_name, return that book's data only.
+
+    Auto-migrates old flat format to new namespaced format:
+      OLD: {"keywords": {...}, "chapter_boundaries": {...}}
+      NEW: {"books": {"BookName": {"keywords": {...}, "chapter_boundaries": {...}}}}
+    """
+    data = {"books": {}}
     if os.path.exists(ROUTES_FILE):
         try:
             with open(ROUTES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
-    return {"keywords": {}, "chapter_boundaries": {}}
+
+    # Migration: old flat format → namespaced
+    if "books" not in data:
+        old = data
+        data = {"books": {}}
+        if old.get("keywords") or old.get("chapter_boundaries"):
+            # Try to guess the book from book_map or active_book
+            legacy_name = _guess_book_for_routes()
+            data["books"][legacy_name] = old
+
+    if book_name:
+        return data["books"].get(book_name, {"keywords": {}, "chapter_boundaries": {}})
+    return data
 
 
-def save_routes(r: dict):
+def _guess_book_for_routes() -> str:
+    """Guess which book legacy routes data belongs to."""
+    # Check active book first
+    active_file = os.path.join(STATE_DIR, "active_book.json")
+    if os.path.exists(active_file):
+        try:
+            with open(active_file, "r", encoding="utf-8") as f:
+                name = json.load(f).get("name")
+                if name:
+                    return name
+        except Exception:
+            pass
+    # Check book_map
+    books = load_book_map()
+    if len(books) == 1:
+        return list(books.keys())[0]
+    return "_legacy"
+
+
+def save_routes(book_name: str, book_routes: dict):
+    """Save chapter routes for a specific book (namespaced)."""
+    data = load_routes()  # returns full {"books": {...}} when no arg
+    data["books"][book_name] = book_routes
     os.makedirs(os.path.dirname(ROUTES_FILE), exist_ok=True)
     with open(ROUTES_FILE, "w", encoding="utf-8") as f:
-        json.dump(r, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _store_auto_stages(book_name: str, parts: list[dict], chapters: list[dict]):
+    """Store auto-detected stages from PDF outline hierarchy.
+
+    Saved to chapter_routes.json under the book's namespace as 'auto_stages'.
+    nlm_progress.py reads this back for stage-grouped display (Fix stage auto-generation).
+    """
+    if not parts:
+        return
+    stages = []
+    for p in parts:
+        ch_nums = [c for c in p["chapter_indices"] if 1 <= c <= len(chapters)]
+        if len(ch_nums) >= 2:
+            stages.append({"name": p["name"], "chapters": ch_nums, "desc": ""})
+    if not stages:
+        return
+    data = load_routes()
+    if "books" not in data:
+        data = {"books": {}}
+    if book_name not in data["books"]:
+        data["books"][book_name] = {"keywords": {}, "chapter_boundaries": {}}
+    data["books"][book_name]["auto_stages"] = stages
+    os.makedirs(os.path.dirname(ROUTES_FILE), exist_ok=True)
+    with open(ROUTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # ── PDF TOC Extraction ─────────────────────────────────────
 
 def extract_toc(pdf_path: str) -> list[dict]:
-    """Extract chapter boundaries from PDF. Three-tier strategy:
+    """Extract chapter boundaries from PDF. Four-tier strategy:
 
-    Tier 1: PDF outline/bookmarks (most reliable, works even for scanned PDFs)
+    Tier 1: PDF outline/bookmarks (handles nested Parts → auto-stages)
     Tier 2: Text-based regex scan (for PDFs with text layer)
     Tier 3: Chapter presets (for known books)
     Tier 4: Even-page fallback (last resort)
@@ -92,6 +290,7 @@ def extract_toc(pdf_path: str) -> list[dict]:
     Returns: [{chapter: int, title: str, start_page: int, end_page: int}, ...]
     """
     total_pages = 100
+    book_name = os.path.splitext(os.path.basename(pdf_path))[0]
     try:
         import PyPDF2
         reader = PyPDF2.PdfReader(pdf_path)
@@ -101,9 +300,13 @@ def extract_toc(pdf_path: str) -> list[dict]:
 
     # ── Tier 1: PDF bookmarks ──
     try:
-        chapters = _extract_toc_from_outline(pdf_path, total_pages)
+        chapters, parts = _extract_toc_from_outline(pdf_path, total_pages)
         if chapters and len(chapters) >= 3:
-            print(f"  TOC via PDF bookmarks: {len(chapters)} chapters")
+            parts_info = f", {len(parts)} parts" if parts else ""
+            print(f"  TOC via PDF bookmarks: {len(chapters)} chapters{parts_info}")
+            # Store parts for stage generation
+            if parts:
+                _store_auto_stages(book_name, parts, chapters)
             return chapters
     except Exception as e:
         pass
@@ -118,9 +321,8 @@ def extract_toc(pdf_path: str) -> list[dict]:
         pass
 
     # ── Tier 3: Known book preset ──
-    book_name = os.path.splitext(os.path.basename(pdf_path))[0]
     for preset_key, preset_chapters in CHAPTER_PRESETS.items():
-        if preset_key in book_name or any(c in book_name for c in ["加密", "解密", "调试", "逆向"]):
+        if preset_key in book_name:
             chapters = _build_preset_chapters(preset_chapters, total_pages)
             if chapters:
                 print(f"  TOC via preset ({preset_key}): {len(chapters)} chapters")
@@ -131,60 +333,194 @@ def extract_toc(pdf_path: str) -> list[dict]:
     return _fallback_even_split(total_pages)
 
 
-def _extract_toc_from_outline(pdf_path: str, total_pages: int) -> list[dict]:
-    """Extract TOC from PDF bookmarks/outline (Tier 1)."""
+def _extract_toc_from_outline(pdf_path: str, total_pages: int) -> tuple[list[dict], list[dict] | None]:
+    """Extract TOC from PDF bookmarks/outline (Tier 1).
+
+    Handles:
+      - Multi-level outlines: parent entries become Parts (for stage generation),
+        child entries become Chapters.
+      - Both leaf and non-leaf chapter entries.
+      - Fallback page resolution: if IndirectObject fails, try text search.
+      - Page number extraction from title (e.g. "... 121" → page 121).
+
+    Returns: (chapters, parts_or_none)
+      chapters: [{chapter: int, title: str, start_page: int}, ...]
+      parts: [{name: str, chapters: [int, ...]}, ...] or None
+    """
     from PyPDF2 import PdfReader
 
     reader = PdfReader(pdf_path)
     outline = reader.outline
     if not outline:
-        return []
+        return [], None
+
+    # First pass: build a page-number lookup by searching PDF text
+    # for bookmark titles (used as fallback when indirect refs fail)
+    _page_search_cache = {}  # title_prefix → page_num
+
+    def _search_title_in_pdf(title: str) -> int | None:
+        """Search for a title in the PDF text to find its page."""
+        clean = title.strip()[:30]
+        if clean in _page_search_cache:
+            return _page_search_cache[clean]
+        # Search first page of each 20-page block (efficient scan)
+        for pg in range(0, min(total_pages, 200), 15):
+            try:
+                text = reader.pages[pg].extract_text()
+                if text and clean[:6] in text:
+                    _page_search_cache[clean] = pg + 1
+                    return pg + 1
+            except Exception:
+                continue
+        _page_search_cache[clean] = None
+        return None
 
     chapters = []
+    parts = []
     chapter_num = 0
+    # Track sub-section accumulation: when a chapter entry has children, the NEXT
+    # list element in the outline is a sub-list containing its sub-sections.
+    # Due to PyPDF2's outline structure, children are siblings, not /Kids.
+    _pending_chapter_subs = None  # dict to fill, or None
 
-    def _flatten(items, depth=0):
-        nonlocal chapter_num
+    def _is_chapter_like(title: str) -> bool:
+        """Check if a title looks like a chapter heading (not a sub-section)."""
+        if re.match(r'第\s*\d+\s*章\b', title):
+            return True
+        if re.match(r'Chapter\s+\d+\b', title, re.IGNORECASE):
+            return True
+        return False
+
+    def _flatten(items, depth=0, parent_chapters=None):
+        nonlocal chapter_num, _pending_chapter_subs
         for item in items:
             if isinstance(item, list):
-                _flatten(item, depth + 1)
+                # If we're expecting sub-sections for the previous chapter,
+                # this sub-list IS the sub-sections. Capture them.
+                if _pending_chapter_subs is not None:
+                    _capture_subsections(item, _pending_chapter_subs)
+                    _pending_chapter_subs = None
+                else:
+                    _flatten(item, depth + 1, parent_chapters)
                 continue
             title = str(item.get("/Title", ""))
             if not title or len(title) < 2 or _is_metadata(title):
                 continue
+
             page_obj = item.get("/Page")
             page_num = _resolve_page_number(reader, page_obj)
+            if page_num is None:
+                page_num = _search_title_in_pdf(title)
+            if page_num is None:
+                m = re.search(r'(\d{1,4})\s*$', title)
+                if m:
+                    p = int(m.group(1))
+                    if 1 <= p <= total_pages + 50:
+                        page_num = min(p, total_pages)
             if page_num is None or page_num < 1:
                 continue
+
             has_kids = bool(item.get("/Count"))
-            # Capture entries that have children (sub-sections) at any depth
-            # These are chapter/section-like entries with content
-            if has_kids:
+            is_chapter_like = _is_chapter_like(title)
+            is_part = has_kids and depth == 0 and not is_chapter_like
+
+            if is_part:
+                part_name = title[:60]
+                part_chapters = []
+                parts.append({"name": part_name, "chapter_indices": part_chapters})
+                _pending_chapter_subs = None
+                _flatten([], depth + 1, parent_chapters=part_chapters)
+            elif is_chapter_like:
                 chapter_num += 1
-                chapters.append({
+                ch_entry = {
                     "chapter": chapter_num,
                     "title": title[:80],
                     "start_page": page_num,
-                })
+                    "sub_sections": {},
+                }
+                if has_kids:
+                    # The next list element in outline is the sub-section list
+                    _pending_chapter_subs = ch_entry["sub_sections"]
+                chapters.append(ch_entry)
+                if parent_chapters is not None:
+                    parent_chapters.append(chapter_num)
+
+    def _capture_subsections(kids_list, ss_dict: dict):
+        """Capture sub-sections from a list of outline items."""
+        sub_idx = 0
+        for kid in kids_list:
+            if isinstance(kid, list):
+                _capture_subsections(kid, ss_dict)
+                continue
+            k_title = str(kid.get("/Title", ""))
+            if not k_title or len(k_title) < 2 or _is_metadata(k_title):
+                continue
+            k_page_obj = kid.get("/Page")
+            k_page = _resolve_page_number(reader, k_page_obj)
+            if k_page is None:
+                k_page = _search_title_in_pdf(k_title)
+            if k_page is None:
+                continue
+            sub_idx += 1
+            # Extract section number from title (e.g., "1.1 标题" or "1.2.3.4 标题")
+            sec_m = re.match(r'(\d+(?:\.\d+)+)', k_title)
+            if sec_m:
+                ss_id = sec_m.group(1)
+            else:
+                ss_id = f"{sub_idx}"  # fallback: sequential
+            ss_dict[ss_id] = {
+                "title": k_title[:80],
+                "start_page": k_page,
+            }
 
     _flatten(outline)
-    return _finalize_chapters(chapters, total_pages)
+
+    if len(chapters) < 3:
+        return _finalize_chapters(chapters, total_pages), None
+
+    chapters = _finalize_chapters(chapters, total_pages)
+
+    # Convert part chapter_indices to actual chapter numbers
+    valid_parts = []
+    for p in parts:
+        actual_chs = [c for c in p["chapter_indices"] if 1 <= c <= len(chapters)]
+        if len(actual_chs) >= 2:
+            valid_parts.append({"name": p["name"], "chapters": actual_chs})
+
+    return chapters, (valid_parts if valid_parts else None)
 
 
 def _resolve_page_number(reader, page_obj) -> int | None:
-    """Resolve a PDF page object to a 1-based page number."""
+    """Resolve a PDF page object to a 1-based page number. Tries multiple methods."""
     if page_obj is None:
         return None
     try:
-        # PyPDF2 way: get PageObject and find its index
-        from PyPDF2 import PageObject, IndirectObject
+        # Import IndirectObject: location depends on PyPDF2 version
+        try:
+            from PyPDF2 import IndirectObject
+        except ImportError:
+            from PyPDF2.generic import IndirectObject
+        try:
+            from PyPDF2.generic import NumberObject
+        except ImportError:
+            NumberObject = int  # fallback
+
+        # Method 1: IndirectObject via get_page_number
         if isinstance(page_obj, IndirectObject):
-            page_num = reader.get_page_number(page_obj)
-            return page_num + 1  # 0-based → 1-based
-        elif hasattr(page_obj, "get_object"):
+            pn = reader.get_page_number(page_obj)
+            return pn + 1 if pn is not None else None
+        # Method 2: has get_object attribute
+        if hasattr(page_obj, "get_object"):
             obj = page_obj.get_object()
-            page_num = reader.get_page_number(obj)
-            return page_num + 1
+            pn = reader.get_page_number(obj)
+            return pn + 1 if pn is not None else None
+        # Method 3: direct integer
+        if isinstance(page_obj, (int, NumberObject)):
+            pn = int(page_obj)
+            return pn + 1 if 0 <= pn < 10000 else pn
+        # Method 4: try get_page_number directly
+        pn = reader.get_page_number(page_obj)
+        return pn + 1 if pn is not None else None
     except Exception:
         pass
     return None
@@ -277,7 +613,7 @@ def _fallback_even_split(total_pages: int) -> list[dict]:
         end = min(start + MAX_PAGES_PER_CHUNK - 1, total_pages)
         chapters.append({
             "chapter": len(chapters) + 1,
-            "title": f"Part {len(chapters) + 1} (pp {start}-{end})",
+            "title": f"第{len(chapters) + 1}部分 (第{start}-{end}页)",
             "start_page": start,
             "end_page": end,
         })
@@ -410,50 +746,83 @@ CHAPTER_PRESETS = {
 }
 
 
-def _fallback_chapter_split(pdf_path: str) -> list:
-    """When TOC extraction fails, try chapter preset then even-page split."""
-    # Try to match a known book preset from the filename
-    book_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    matched_preset = None
-    for preset_key, preset_chapters in CHAPTER_PRESETS.items():
-        if preset_key in book_name or any(c in book_name for c in ["加密", "解密"]):
-            matched_preset = preset_chapters
-            print(f"  Using chapter preset for: {preset_key}")
-            break
+def _detect_book_depth(chapters: list[dict]) -> int:
+    """Detect the maximum section depth across all chapters.
 
-    try:
-        import PyPDF2
-        reader = PyPDF2.PdfReader(pdf_path)
-        total_pages = len(reader.pages)
-    except Exception:
-        total_pages = 948
+    Depth 1 = only chapters (no sub-sections)
+    Depth 2 = X.Y level (e.g. 1.1, 2.3)
+    Depth 3 = X.Y.Z level (e.g. 1.1.1, 2.3.4)
+    Depth 4+ = deeper nesting
 
-    if matched_preset:
-        chapters = []
-        for ch_num in sorted(matched_preset.keys()):
-            entry = matched_preset[ch_num]
-            start, end, title = entry[0], entry[1], entry[2]
-            keywords_str = entry[3] if len(entry) > 3 else ""
-            chapters.append({
-                "chapter": ch_num,
-                "title": f"第{ch_num}章 {title}",
-                "start_page": start,
-                "end_page": min(end, total_pages),
-                "keywords": keywords_str,
+    Returns the max depth found, min 1.
+    """
+    max_depth = 1
+    for ch in chapters:
+        subs = ch.get("sub_sections", {})
+        for sec_id in subs:
+            depth = sec_id.count(".") + 1
+            if depth > max_depth:
+                max_depth = depth
+    return max_depth
+
+
+def _detect_depth_from_routes(routes_data: dict) -> int:
+    """Detect max depth from routes_data structure."""
+    max_depth = 1
+    boundaries = routes_data.get("chapter_boundaries", {})
+    for ch_str, b in boundaries.items():
+        subs = b.get("sub_sections", {})
+        for sec_id in subs:
+            depth = sec_id.count(".") + 1
+            if depth > max_depth:
+                max_depth = depth
+    return max_depth
+
+
+def _auto_generate_stages_if_needed(book_name: str, chapters: list[dict]):
+    """If no auto_stages exist yet, generate them by evenly grouping chapters.
+
+    Only for books with 9+ chapters — groups them into ~5 stages of roughly equal size.
+    """
+    if not chapters or len(chapters) < 9:
+        return
+    # Check if stages already exist from PDF outline
+    routes = load_routes()
+    books = routes.get("books", {})
+    book_data = books.get(book_name, {})
+    if book_data.get("auto_stages"):
+        return  # Already have stages from PDF outline
+
+    total = len(chapters)
+    num_stages = min(5, max(2, total // 3))  # Aim for ~3 chapters per stage
+    if num_stages < 2:
+        return
+
+    stage_size = (total + num_stages - 1) // num_stages  # Ceiling division
+    stages = []
+    for i in range(num_stages):
+        start_idx = i * stage_size
+        end_idx = min(start_idx + stage_size, total)
+        stage_chs = list(range(start_idx + 1, end_idx + 1))
+        if len(stage_chs) >= 2:
+            stages.append({
+                "name": f"第{start_idx + 1}-{end_idx}章",
+                "chapters": stage_chs,
+                "desc": "",
             })
-        return chapters
 
-    # Even-page fallback
-    chapters = []
-    for start in range(1, total_pages + 1, MAX_PAGES_PER_CHUNK):
-        end = min(start + MAX_PAGES_PER_CHUNK - 1, total_pages)
-        chapters.append({
-            "chapter": len(chapters) + 1,
-            "title": f"Part {len(chapters) + 1} (pp {start}-{end})",
-            "start_page": start,
-            "end_page": end,
-        })
-    return chapters
+    if not stages:
+        return
+
+    if book_name not in books:
+        books[book_name] = {"keywords": {}, "chapter_boundaries": {}}
+    books[book_name]["auto_stages"] = stages
+    routes["books"] = books
+    os.makedirs(os.path.dirname(ROUTES_FILE), exist_ok=True)
+    with open(ROUTES_FILE, "w", encoding="utf-8") as f:
+        json.dump(routes, f, ensure_ascii=False, indent=2)
+
+    print(f"  Auto-generated {len(stages)} stages ({num_stages} groups of ~{stage_size} chapters)")
 
 
 # ── PDF Splitting ──────────────────────────────────────────
@@ -514,18 +883,20 @@ def compute_chunks(chapters: list, max_pages: int = MAX_PAGES_PER_CHUNK) -> list
     if current_start is not None:
         chunks.append(_make_chunk(current_name_parts, current_start, current_end))
 
-    # Also record in chapter_routes.json for future routing
-    routes = load_routes()
+    # Build chapter routes dict (saved later only after OCR success — Fix #6)
+    routes_data = {"keywords": {}, "chapter_boundaries": {}, "max_depth": _detect_book_depth(chapters)}
     for ch in chapters:
-        routes["chapter_boundaries"][str(ch["chapter"])] = {
+        entry = {
             "start": ch["start_page"],
             "end": ch["end_page"],
             "title": ch["title"],
         }
-    # Auto-seed keywords from chapter titles and preset keywords
+        # Store sub-section structure from PDF bookmarks
+        if ch.get("sub_sections"):
+            entry["sub_sections"] = ch["sub_sections"]
+        routes_data["chapter_boundaries"][str(ch["chapter"])] = entry
     for ch in chapters:
         title = ch["title"]
-        # Use preset keywords if available, otherwise extract from title
         if ch.get("keywords"):
             terms = ch["keywords"].split("|")
         else:
@@ -533,17 +904,16 @@ def compute_chunks(chapters: list, max_pages: int = MAX_PAGES_PER_CHUNK) -> list
         for term in terms:
             term = term.strip()
             if term and len(term) >= 2:
-                if term not in routes["keywords"]:
-                    routes["keywords"][term] = {
+                if term not in routes_data["keywords"]:
+                    routes_data["keywords"][term] = {
                         "chapter": ch["chapter"],
                         "pages": f"{ch['start_page']}-{ch['end_page']}",
                         "source": "preset" if ch.get("keywords") else "toc_seed",
                         "hits": 0,
                         "last_hit": "",
                     }
-    save_routes(routes)
 
-    return chunks
+    return chunks, routes_data
 
 
 def _make_chunk(name_parts: list, start: int, end: int) -> dict:
@@ -772,17 +1142,38 @@ def _check_and_report(path: str, max_mb: int, engine_name: str) -> bool:
 
 # ── NotebookLM Operations ──────────────────────────────────
 
+def _refresh_auth_before_upload():
+    """Refresh NotebookLM auth before the long upload+OCR phase (Fix #5)."""
+    try:
+        import subprocess
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        relogin_script = os.path.join(scripts_dir, "nlm_query.py")
+        if os.path.exists(relogin_script):
+            r = subprocess.run(
+                [sys.executable, relogin_script, "--relogin"],
+                capture_output=True, timeout=60,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+            )
+            if r.returncode == 0:
+                print("  Auth refreshed before upload")
+            else:
+                print(f"  [WARN] Auth refresh skipped (may already be fresh)")
+    except Exception:
+        pass  # Non-critical
+
+
 async def create_and_upload_all(
-    split_pdfs: list[str], book_name: str, wait_for_ocr: bool = True,
-    ocr_timeout: int = 600,
+    split_pdfs: list[str], book_name: str, routes_data: dict = None,
+    wait_for_ocr: bool = True, ocr_timeout: int = 600,
 ) -> tuple[str, str, list, bool]:
     """Create notebook + upload all split PDFs. Returns (nb_id, title, sources, all_ready).
 
-    CRITICAL: ALL sources must pass OCR before all_ready=True.
-    If any source fails OCR after retries, the notebook is NOT marked ready
-    and the caller should NOT activate this notebook.
+    routes_data: if provided, saved to chapter_routes.json ONLY after OCR success (Fix #6).
     """
     from notebooklm import NotebookLMClient
+
+    # Fix #5: Refresh auth before a potentially long upload+OCR phase
+    _refresh_auth_before_upload()
 
     print(f"\n[1/3] Creating notebook \"{book_name}\"...")
     async with await NotebookLMClient.from_storage() as client:
@@ -801,9 +1192,9 @@ async def create_and_upload_all(
             try:
                 source = await client.sources.add_file(full_nb_id, pdf_path, wait=False)
                 sources.append(source)
-                print(f"  ✓ Uploaded: {source.id}")
+                print(f"  [OK] Uploaded: {source.id}")
             except Exception as e:
-                print(f"  ✗ Upload failed: {e}")
+                print(f"  [FAIL] Upload failed: {e}")
                 upload_errors.append(fname)
 
         if not sources:
@@ -836,10 +1227,10 @@ async def create_and_upload_all(
                         print(f"    Retry {attempt+1} in {wait_s}s: {str(e)[:80]}")
                         await asyncio.sleep(wait_s)
                     else:
-                        print(f"    ✗ OCR failed after 3 attempts: {str(e)[:120]}")
+                        print(f"    [FAIL] OCR failed after 3 attempts: {str(e)[:120]}")
 
             if ok:
-                print(f"    ✓ OCR ready")
+                print(f"    [OK] OCR ready")
                 ocr_ready.append(fname)
             else:
                 ocr_failed.append(fname)
@@ -847,7 +1238,7 @@ async def create_and_upload_all(
         all_ready = len(ocr_failed) == 0
 
         if not all_ready:
-            print(f"\n  ✗ OCR INCOMPLETE: {len(ocr_ready)}/{len(sources)} ready, "
+            print(f"\n  [FAIL] OCR INCOMPLETE: {len(ocr_ready)}/{len(sources)} ready, "
                   f"{len(ocr_failed)} failed")
             for fname in ocr_failed:
                 print(f"      FIX: try re-uploading '{fname}' as smaller chunks")
@@ -855,7 +1246,16 @@ async def create_and_upload_all(
                 print(f"  Upload errors: {len(upload_errors)}")
             print(f"  Notebook {nb_id.split('-')[0]} NOT marked as ready.")
         else:
-            print(f"\n  ✓ ALL {len(ocr_ready)}/{len(sources)} sources OCR-ready")
+            print(f"\n  [OK] ALL {len(ocr_ready)}/{len(sources)} sources OCR-ready")
+            # Fix #6: Only save chapter routes AFTER successful OCR
+            if routes_data:
+                save_routes(book_name, routes_data)
+                print(f"  Chapter routes saved for \"{book_name}\"")
+                # Auto-detect sub-section tree from NotebookLM
+                try:
+                    await _ensure_full_toc(book_name, nb_id)
+                except Exception:
+                    pass
 
     return nb_id.split("-")[0], notebook.title, sources, all_ready
 
@@ -926,10 +1326,10 @@ def cleanup_old_notebooks(book_name: str, new_nb_id: str):
             continue
         print(f"  Deleting old notebook: {k} ({old_id})")
         if asyncio.run(delete_notebook_completely(old_id)):
-            print(f"    ✓ Deleted from NotebookLM")
+            print(f"    [OK] Deleted from NotebookLM")
             deleted_ids.add(old_id)
         else:
-            print(f"    ⚠ Could not delete from API (may already be gone)")
+            print(f"    [WARN] Could not delete from API (may already be gone)")
         del books[k]
 
     save_book_map(books)
@@ -993,7 +1393,7 @@ def main():
         print(f"ERROR: PDF not found: {pdf_path}")
         return 1
 
-    book_name = args.name or os.path.splitext(os.path.basename(pdf_path))[0]
+    book_name = args.name or _clean_book_name(os.path.splitext(os.path.basename(pdf_path))[0])
 
     print("=" * 60)
     print(f"  Adding book: {book_name}")
@@ -1026,7 +1426,9 @@ def main():
     else:
         print(f"  >{MAX_PAGES_PER_CHUNK} pages — extracting TOC and splitting by chapters...")
         chapters = extract_toc(upload_path)
-        chunks = compute_chunks(chapters, MAX_PAGES_PER_CHUNK)
+        # Auto-generate stages if PDF outline had no Parts (even-group fallback)
+        _auto_generate_stages_if_needed(book_name, chapters)
+        chunks, routes_data = compute_chunks(chapters, MAX_PAGES_PER_CHUNK)
         print(f"  → {len(chunks)} chunks (max {MAX_PAGES_PER_CHUNK} pages each):")
         for c in chunks:
             print(f"      {c['name']}: pp {c['start']}-{c['end']} ({c['end']-c['start']+1} pages)")
@@ -1042,8 +1444,9 @@ def main():
     # Step 2-3: Create notebook + upload all
     all_ready = False
     try:
+        routes_arg = routes_data if total_pages > MAX_PAGES_PER_CHUNK + 10 else None
         nb_id, title, sources, all_ready = asyncio.run(create_and_upload_all(
-            split_pdfs, book_name, wait_for_ocr=not args.no_wait
+            split_pdfs, book_name, routes_data=routes_arg, wait_for_ocr=not args.no_wait
         ))
     except Exception as e:
         msg = str(e)
@@ -1062,7 +1465,7 @@ def main():
 
     if not all_ready:
         print(f"\n{'=' * 60}")
-        print(f"  ✗ Book \"{book_name}\" setup incomplete.")
+        print(f"  [FAIL] Book \"{book_name}\" setup incomplete.")
         print(f"  Notebook {nb_id} exists but some sources failed OCR.")
         print(f"  Check the errors above and fix before retrying.")
         print(f"  Old notebooks NOT cleaned (new one not fully ready).")
@@ -1093,7 +1496,58 @@ def main():
     print(f"  You can now ask Claude any question about this book.")
     print(f"{'=' * 60}")
 
+    # Step 6: Auto-init learning progress (drop-and-go)
+    _auto_init_progress(book_name, book_name)
+
     return 0
+
+
+def _auto_init_progress(book_name: str, progress_book_name: str = None):
+    """Auto-initialize learning progress for a newly added book.
+
+    Extracts chapter count from chapter_routes.json boundaries,
+    then calls nlm_progress.py --init with the discovered order.
+    If the book already has progress data, skips silently.
+    """
+    target = progress_book_name or book_name
+    # Check if already initialized
+    progress_file = os.path.expanduser(r"~\.notebooklm\learning_progress.json")
+    if os.path.exists(progress_file):
+        try:
+            with open(progress_file, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if target in existing:
+                # Check fuzzy match
+                for k in existing:
+                    if target in k or k in target:
+                        return  # Already initialized
+        except Exception:
+            pass
+
+    # Get chapter count from routes
+    routes = load_routes()
+    books = routes.get("books", {})
+    book_routes = books.get(book_name, {})
+    boundaries = book_routes.get("chapter_boundaries", {})
+    if not boundaries:
+        return
+
+    ch_nums = sorted(int(k) for k in boundaries.keys())
+    if not ch_nums:
+        return
+
+    order_spec = ",".join(str(c) for c in ch_nums)
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    progress_script = os.path.join(scripts_dir, "nlm_progress.py")
+    try:
+        subprocess.run(
+            [sys.executable, progress_script, "--init", target, order_spec],
+            capture_output=True, timeout=30,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+        )
+        print(f"  Learning progress auto-initialized ({len(ch_nums)} chapters)")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

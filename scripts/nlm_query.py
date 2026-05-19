@@ -373,27 +373,97 @@ def cache_clear():
         os.makedirs(CACHE_DIR, exist_ok=True)
 
 
-# ── Chapter Routes (auto-learning) ────────────────────────
+# ── Chapter Routes (auto-learning, namespaced by book) ─────
 
-def _load_chapter_routes() -> dict:
-    if os.path.exists(CHAPTER_ROUTES_FILE):
+def _resolve_active_book_name() -> str | None:
+    """Get the active book name from active_book.json (same as nlm_progress)."""
+    active_file = os.path.join(STATE_DIR, "active_book.json")
+    if os.path.exists(active_file):
         try:
-            with open(CHAPTER_ROUTES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(active_file, "r", encoding="utf-8") as f:
+                return json.load(f).get("name")
         except (json.JSONDecodeError, OSError):
             pass
+    # Fallback: first book in book_map
+    book_map = _load_book_map()
+    if book_map:
+        return next(iter(book_map.keys()))
+    return None
+
+
+def _load_chapter_routes(book_name: str = None) -> dict:
+    """Load chapter routes for a book. Auto-migrates old flat format.
+
+    Returns: {"keywords": {...}, "chapter_boundaries": {...}} for the book.
+    """
+    if not os.path.exists(CHAPTER_ROUTES_FILE):
+        return {"keywords": {}, "chapter_boundaries": {}}
+    try:
+        with open(CHAPTER_ROUTES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"keywords": {}, "chapter_boundaries": {}}
+
+    # Migration: old flat format → namespaced
+    if "books" not in data:
+        old = data
+        data = {"books": {}}
+        if old.get("keywords") or old.get("chapter_boundaries"):
+            active = book_name or _resolve_active_book_name() or "_legacy"
+            data["books"][active] = old
+
+    if book_name:
+        return data["books"].get(book_name, {"keywords": {}, "chapter_boundaries": {}})
+    # Fallback: use active book
+    active = _resolve_active_book_name()
+    if active and active in data.get("books", {}):
+        return data["books"][active]
+    # Last resort: first book
+    books = data.get("books", {})
+    if books:
+        return next(iter(books.values()))
     return {"keywords": {}, "chapter_boundaries": {}}
 
 
-def _save_chapter_routes(r: dict):
+def _save_chapter_routes(book_name: str, book_routes: dict):
+    """Save chapter routes for a specific book (namespaced)."""
+    data = {}
+    if os.path.exists(CHAPTER_ROUTES_FILE):
+        try:
+            with open(CHAPTER_ROUTES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    if "books" not in data:
+        data = {"books": {}}
+    data["books"][book_name] = book_routes
     os.makedirs(os.path.dirname(CHAPTER_ROUTES_FILE), exist_ok=True)
     with open(CHAPTER_ROUTES_FILE, "w", encoding="utf-8") as f:
-        json.dump(r, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _auto_track_progress(chapter_num: int):
+    """Call nlm_progress.auto_track_learning for the given chapter."""
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        from nlm_progress import auto_track_learning
+    except ImportError:
+        return
+
+    book_name = _resolve_active_book_name()
+    if book_name:
+        auto_track_learning(book_name, chapter_num)
 
 
 def _route_question(question: str) -> tuple[str | None, str | None]:
-    """Match question keywords to chapter/page range. Returns (chapter_hint, pages)."""
-    routes = _load_chapter_routes()
+    """Match question keywords to chapter/page range. Returns (chapter_hint, pages).
+
+    Uses namespaced chapter_routes — only searches the active book's keywords (Fix #1).
+    """
+    book_name = _resolve_active_book_name()
+    routes = _load_chapter_routes(book_name)
     keywords = routes.get("keywords", {})
     boundaries = routes.get("chapter_boundaries", {})
 
@@ -408,10 +478,9 @@ def _route_question(question: str) -> tuple[str | None, str | None]:
             if ch and str(ch) in boundaries:
                 b = boundaries[str(ch)]
                 pages = f"{b['start']}-{b['end']}"
-            # Increment hit counter
             info["hits"] = info.get("hits", 0) + 1
             info["last_hit"] = time.strftime("%Y-%m-%d")
-            _save_chapter_routes(routes)
+            _save_chapter_routes(book_name, routes)
             return f"第{ch}章", pages
 
     # Fallback: check if any chapter number mentioned in question
@@ -426,11 +495,19 @@ def _route_question(question: str) -> tuple[str | None, str | None]:
 
 
 def _learn_from_result(question: str, answer: str):
-    """Extract page numbers from answer and auto-register keywords."""
+    """Extract page numbers from answer and auto-register keywords.
+
+    Fix #4: Uses chapter that appears most frequently in cited pages
+    (not last-match-wins), so a chapter cited 5 times beats one cited once.
+    """
     if not answer or "ERROR" in answer:
         return
 
-    routes = _load_chapter_routes()
+    book_name = _resolve_active_book_name()
+    if not book_name:
+        return
+
+    routes = _load_chapter_routes(book_name)
     keywords = routes.get("keywords", {})
     boundaries = routes.get("chapter_boundaries", {})
 
@@ -439,42 +516,50 @@ def _learn_from_result(question: str, answer: str):
     if not pages_found:
         return
 
-    # Determine which chapter
+    # Fix #4: Count which chapter each cited page falls into.
+    # Use the most-frequent chapter (not last-match).
+    ch_counts: dict[int, int] = {}
     for page_str in pages_found:
         page = int(page_str)
-        matched_ch = None
         for ch_num, b in boundaries.items():
             if b["start"] <= page <= b["end"]:
-                matched_ch = int(ch_num)
+                ch_counts[int(ch_num)] = ch_counts.get(int(ch_num), 0) + 1
                 break
 
-        if matched_ch is None:
-            continue
+    if not ch_counts:
+        return
 
-        # Extract potential keywords from the question
-        # Chinese terms (2-4 chars) and English abbreviations
-        terms = set()
-        for m in re.finditer(r'\b([A-Z]{2,6})\b', question):
-            terms.add(m.group(1))
-        # Chinese nouns: after removing question words
-        clean = re.sub(r'是什么|怎么|什么|如何|为什么|的第|在第|书中|原文|定义|请|查询|查找|关于', '', question)
-        for m in re.finditer(r'([一-鿿]{2,4})', clean):
-            terms.add(m.group(1))
+    # Pick the chapter with the most page citations
+    matched_ch = max(ch_counts, key=ch_counts.get)
 
-        for term in terms:
-            if term and term not in keywords:
-                keywords[term] = {
-                    "chapter": matched_ch,
-                    "pages": f"{boundaries[str(matched_ch)]['start']}-{boundaries[str(matched_ch)]['end']}",
-                    "source": "learned",
-                    "hits": 1,
-                    "last_hit": time.strftime("%Y-%m-%d"),
-                }
-            elif term in keywords:
-                keywords[term]["hits"] = keywords[term].get("hits", 0) + 1
-                keywords[term]["last_hit"] = time.strftime("%Y-%m-%d")
+    # Extract potential keywords from the question
+    terms = set()
+    for m in re.finditer(r'\b([A-Z]{2,6})\b', question):
+        terms.add(m.group(1))
+    clean = re.sub(r'是什么|怎么|什么|如何|为什么|的第|在第|书中|原文|定义|请|查询|查找|关于', '', question)
+    for m in re.finditer(r'([一-鿿]{2,4})', clean):
+        terms.add(m.group(1))
 
-    _save_chapter_routes(routes)
+    for term in terms:
+        if term and term not in keywords:
+            keywords[term] = {
+                "chapter": matched_ch,
+                "pages": f"{boundaries[str(matched_ch)]['start']}-{boundaries[str(matched_ch)]['end']}",
+                "source": "learned",
+                "hits": 1,
+                "last_hit": time.strftime("%Y-%m-%d"),
+            }
+        elif term in keywords:
+            keywords[term]["hits"] = keywords[term].get("hits", 0) + 1
+            keywords[term]["last_hit"] = time.strftime("%Y-%m-%d")
+
+    _save_chapter_routes(book_name, routes)
+
+    # Auto-track learning progress
+    try:
+        _auto_track_progress(matched_ch)
+    except Exception:
+        pass
 
 
 # ── Query Optimization ─────────────────────────────────────
@@ -698,8 +783,10 @@ def query(question: str, notebook: str = None) -> str:
     answer, ok = ask(optimized, nb)
 
     # Auto-retry if NotebookLM says "仅涵盖至前166页" etc.
+    # Hard cap at 5 retries — was 66+ infinite loop when API fails (fixed).
+    MAX_RETRIES = 5
     retry_count = 0
-    while not ok or (_is_fail_signal(answer) and retry_count < 3):
+    while retry_count < MAX_RETRIES and (not ok or _is_fail_signal(answer)):
         retry_count += 1
         if retry_count == 1:
             # Try with narrower scope — add chapter hint from routes

@@ -196,6 +196,79 @@ When the user explicitly challenges, questions, or corrects a factual claim abou
 
 **2026-05-17 incident:** User challenged CS segment values (0x1B vs 0x23). Claude initially defended 0x1B. NotebookLM confirmed BOTH are correct in different contexts: 0x1B on pure 32-bit Windows (page 18), 0x23 on WOW64 x64 system (page 49). Without R14, this would have been a pointless back-and-forth.
 
+### R16: Follow lowest-level section order — never skip or jump chapters
+
+Learning MUST follow the book's lowest-level section sequence in order. If the book has 3-level depth (e.g., 7.1.1, 7.1.2, 7.2.1), then each lowest-level section is a learning unit, and they are consumed strictly sequentially:
+
+```
+7.1.1 → 7.1.2 → 7.1.3 → ... → 7.1.6 → 7.2.1 → 7.2.2 → ... → 7.3.1 → ...
+```
+
+**Never:** "7.2 is done, let's jump to 7.3." 7.2.1-7.2.4 being done does NOT mean all of 7.1.x is done. Always consult `--next` to determine the correct next section.
+
+**Why:** The book's structure is designed to be read in order. Jumping ahead creates knowledge gaps. The user explicitly chose this learning path and expects section-by-section progression.
+
+**How to apply:**
+1. After completing any section, run `nlm_progress.py --next` to get the next correct section
+2. Never suggest skipping to a higher-level section unless the user explicitly requests it
+3. If the user seems to be jumping around, remind them of the correct next section from `--next`
+
+**2026-05-19 incident:** After finishing 7.2.4, suggested jumping to 7.3, but the correct next section was 7.1.1 (since 7.1.1-7.1.3 were skipped earlier). Progress tracker correctly showed 7.1.1 as next; Claude disregarded it.
+
+### R17: Outline-first learning — knowledge points table BEFORE deep dive
+
+When the user starts a new section, do NOT immediately query NotebookLM with a specific deep-dive question. Instead, follow a two-phase approach:
+
+**Phase 1 — Knowledge point discovery:**
+```
+用户："学 7.1.1"
+  → 查询 NotebookLM："请列出第7.1.1节包含的所有知识点。"
+  → 解析回答，汇总为本节的知识点总表
+  → 呈现给用户
+```
+
+**CRITICAL:** The query MUST only reference the bare section number — NEVER include the section title or any descriptive keywords. Including the title ("内核对象") biases NotebookLM to return only points matching that keyword, potentially omitting other knowledge points in the same section.
+
+```
+[OK]     "请列出第7.2.1节包含的所有知识点。"
+[WRONG]  "请列出第7.2.1节'内核对象'包含的所有知识点。"  ← 内核对象 会过滤结果
+```
+
+**Phase 2 — Deep dive (auto or manual):**
+
+| 知识点数量 | 行为 |
+|-----------|------|
+| 1-2 个 | 自动进入深入学习，逐点查询+讲解，不等待确认 |
+| ≥3 个 | 呈现总表，等待用户确认后逐点推进 |
+
+**Knowledge point table format:**
+```
+## 7.1.1 权限级别 — 知识点总表
+
+| # | 知识点 | 页码 |
+|---|--------|------|
+| 1 | Ring0/Ring3 权限模型 | 290 |
+| 2 | x86 段选择子与 CS/SS 寄存器 | 290-291 |
+| 3 | x64 下的权限控制 | 291 |
+| ... | ... | ... |
+```
+
+**Deep dive per knowledge point:**
+- Each point gets its own NotebookLM query with specific page references
+- After each point, mark progress (`_mark_kp_done`)
+- All points done → mark section as "done"
+
+**Why:** Querying with a broad "tell me everything" gets shallow answers. Querying one specific concept gets deep, cited answers. The outline-first approach ensures no knowledge point is missed and each gets proper depth.
+
+**How to apply:**
+1. User says "学 X.Y.Z" → first query for knowledge points, not content
+2. Parse the response: extract bullet/numbered items as knowledge points
+3. ≤2 points → immediately deep-dive each. ≥3 points → present table, wait for "开始"
+4. Proceed point-by-point, each with its own focused NotebookLM query
+5. Track which points are done within the section
+
+**2026-05-19:** Added to prevent shallow "teach me the whole section" queries that miss detail and get lower-quality NotebookLM answers.
+
 ---
 
 ## When This Skill Triggers
